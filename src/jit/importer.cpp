@@ -1074,7 +1074,7 @@ GenTreePtr Compiler::impAssignStruct(GenTreePtr     dest,
 
 /*****************************************************************************/
 
-GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
+GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      destAddr,
                                         GenTreePtr      src,
                                         CORINFO_CLASS_HANDLE    structHnd,
                                         unsigned        curLevel,
@@ -1082,6 +1082,8 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
                                         BasicBlock    * block        /* = NULL */
                                        ) 
 {
+    GenTreePtr dest = nullptr;
+
 #if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
     assert(varTypeIsStruct(src) ||  (src->gtOper == GT_ADDR && src->TypeGet() == TYP_BYREF));
     // TODO-ARM-BUG: Does ARM need this?
@@ -1109,7 +1111,7 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
             // Case of call returning a struct via hidden retbuf arg
 
             // insert the return value buffer into the argument list as first byref parameter
-            src->gtCall.gtCallArgs = gtNewListNode(dest, src->gtCall.gtCallArgs);
+            src->gtCall.gtCallArgs = gtNewListNode(destAddr, src->gtCall.gtCallArgs);
 
             // now returns void, not a struct
             src->gtType = TYP_VOID;
@@ -1123,17 +1125,26 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
 
             var_types returnType = (var_types)src->gtCall.gtReturnType;
 
-            // We don't need a return buffer, so just change this to "(returnType)*dest = call"
+            // We won't use a return buffer, so change the type of src->gtType to 'returnType'
             src->gtType = genActualType(returnType);
 
-            if ((dest->gtOper == GT_ADDR) && (dest->gtOp.gtOp1->gtOper == GT_LCL_VAR))
+            // First we try to change this to "LclVar/LclFld = call"
+            //
+            if ((destAddr->gtOper == GT_ADDR) && (destAddr->gtOp.gtOp1->gtOper == GT_LCL_VAR))
             {
                 // If it is a multi-reg struct return, don't change the oper to GT_LCL_FLD.
-                // That is, IR will be of the form lclVar = call for multi-reg return
-
-                GenTreePtr lcl = dest->gtOp.gtOp1;
-                if (!src->AsCall()->HasMultiRegRetVal())
+                // That is, the IR will be of the form lclVar = call for multi-reg return
+                //
+                GenTreePtr lcl = destAddr->gtOp.gtOp1;
+                if (src->AsCall()->HasMultiRegRetVal())
                 {
+                    // Mark the struct LclVar as used in a MultiReg return context
+                    //  which currently makes it non promotable. 
+                    lvaTable[lcl->gtLclVarCommon.gtLclNum].lvIsMultiRegRet = true;
+                }
+                else  // The call result is not a multireg return 
+                {
+                    // We change this to a GT_LCL_FLD (from a GT_ADDR of a GT_LCL_VAR)
                     lcl->ChangeOper(GT_LCL_FLD);
                     fgLclFldAssign(lcl->gtLclVarCommon.gtLclNum);
                 }                
@@ -1148,12 +1159,13 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
                 assert(!src->gtCall.IsVarargs() && "varargs not allowed for System V OSs.");
 
                 // Make the struct non promotable. The eightbytes could contain multiple fields.
-                lvaTable[lcl->gtLclVarCommon.gtLclNum].lvIsMultiRegArgOrRet = true;
+                lvaTable[lcl->gtLclVarCommon.gtLclNum].lvIsMultiRegRet = true;
 #endif
             }
-            else
+            else  // we don't have a GT_ADDR of a GT_LCL_VAR
             {
-                dest = gtNewOperNode(GT_IND, returnType, dest);
+                // We change this to "(returnType)*destAddr = call"
+                dest = gtNewOperNode(GT_IND, returnType, destAddr);
 
                 // !!! The destination could be on stack. !!!
                 // This flag will let us choose the correct write barrier.
@@ -1171,7 +1183,7 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
         if (call->AsCall()->HasRetBufArg())
         {
             // insert the return value buffer into the argument list as first byref parameter
-            call->gtCall.gtCallArgs = gtNewListNode(dest, call->gtCall.gtCallArgs);
+            call->gtCall.gtCallArgs = gtNewListNode(destAddr, call->gtCall.gtCallArgs);
 
             // now returns void, not a struct
             src->gtType  = TYP_VOID;
@@ -1183,12 +1195,15 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
         }
         else
         {
+            // Case of inline method returning a struct in one or more registers.
+            //
             var_types returnType = (var_types)call->gtCall.gtReturnType;
 
-            src->gtType  = genActualType(returnType);
+            // We won't need a return buffer
+            src->gtType = genActualType(returnType);
             call->gtType = src->gtType;
 
-            dest = gtNewOperNode(GT_IND, returnType, dest);
+            dest = gtNewOperNode(GT_IND, returnType, destAddr);
 
             // !!! The destination could be on stack. !!!
             // This flag will let us choose the correct write barrier.
@@ -1205,19 +1220,19 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
     else if (src->gtOper == GT_MKREFANY)
     {
         // Since we are assigning the result of a GT_MKREFANY, 
-        // "dest" must point to a refany.
+        // "destAddr" must point to a refany.
 
-        GenTreePtr destClone;
-        dest = impCloneExpr(dest, &destClone, structHnd, curLevel, pAfterStmt DEBUGARG("MKREFANY assignment") );
+        GenTreePtr destAddrClone;
+        destAddr = impCloneExpr(destAddr, &destAddrClone, structHnd, curLevel, pAfterStmt DEBUGARG("MKREFANY assignment") );
 
         assert(offsetof(CORINFO_RefAny, dataPtr) == 0);
-        assert(dest->gtType == TYP_I_IMPL || dest->gtType == TYP_BYREF);
-        GetZeroOffsetFieldMap()->Set(dest, GetFieldSeqStore()->CreateSingleton(GetRefanyDataField()));
-        GenTreePtr ptrSlot  = gtNewOperNode(GT_IND, TYP_I_IMPL, dest);
+        assert(destAddr->gtType == TYP_I_IMPL || destAddr->gtType == TYP_BYREF);
+        GetZeroOffsetFieldMap()->Set(destAddr, GetFieldSeqStore()->CreateSingleton(GetRefanyDataField()));
+        GenTreePtr ptrSlot  = gtNewOperNode(GT_IND, TYP_I_IMPL, destAddr);
         GenTreeIntCon* typeFieldOffset = gtNewIconNode(offsetof(CORINFO_RefAny, type), TYP_I_IMPL);
         typeFieldOffset->gtFieldSeq = GetFieldSeqStore()->CreateSingleton(GetRefanyTypeField());
         GenTreePtr typeSlot = gtNewOperNode(GT_IND, TYP_I_IMPL,
-                                  gtNewOperNode(GT_ADD, dest->gtType, destClone, typeFieldOffset));
+                                  gtNewOperNode(GT_ADD, destAddr->gtType, destAddrClone, typeFieldOffset));
 
         // append the assign of the pointer value
         GenTreePtr asg = gtNewAssignNode(ptrSlot, src->gtOp.gtOp1);
@@ -1235,7 +1250,7 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
     }
     else if (src->gtOper == GT_COMMA)
     {
-        // Second thing is the struct or it's address.
+        // The second thing is the struct or its address.
         assert(varTypeIsStruct(src->gtOp.gtOp2) || src->gtOp.gtOp2->gtType == TYP_BYREF);
         if (pAfterStmt)
         {
@@ -1246,8 +1261,8 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
             impAppendTree(src->gtOp.gtOp1, curLevel, impCurStmtOffs);  // do the side effect
         }
 
-        // evaluate the second thing using recursion
-        return impAssignStructPtr(dest, src->gtOp.gtOp2, structHnd, curLevel, pAfterStmt, block);
+        // Evaluate the second thing using recursion.
+        return impAssignStructPtr(destAddr, src->gtOp.gtOp2, structHnd, curLevel, pAfterStmt, block);
     }
     else if (src->gtOper == GT_ADDR)
     {
@@ -1259,7 +1274,7 @@ GenTreePtr Compiler::impAssignStructPtr(GenTreePtr      dest,
     }
 
     // return a CpObj node, to be appended
-    return gtNewCpObjNode(dest, src, structHnd, false);
+    return gtNewCpObjNode(destAddr, src, structHnd, false);
 }
 
 /*****************************************************************************
@@ -1283,7 +1298,7 @@ GenTreePtr Compiler::impGetStructAddr(GenTreePtr    structVal,
     if (oper == GT_OBJ && willDeref)
     {
         assert(structVal->gtObj.gtClass == structHnd);
-        return(structVal->gtObj.gtOp.gtOp1);
+        return(structVal->gtObj.Addr());
     }
     else if (oper == GT_CALL || oper == GT_RET_EXPR || oper == GT_OBJ || oper == GT_MKREFANY)
     {
@@ -3378,13 +3393,6 @@ InterlockedBinOpCommon:
         if (retNode == nullptr)
         {
             NO_WAY("JIT must expand the intrinsic!");
-        }
-        else if ((retNode->gtFlags & GTF_CALL) != 0)
-        {
-            // If we must expand the intrinsic,
-            // retNode (the tree that corresponds to the intrinsic expansion) must be non-null,
-            // and the returned tree must not contain a call.
-            NO_WAY("JIT must not implement the intrinsic by a user call!");
         }
     }
 
@@ -5989,7 +5997,14 @@ var_types  Compiler::impImportCall(OPCODE                  opcode,
         // assume the worst-case.
         mflags  = (calliSig.callConv & CORINFO_CALLCONV_HASTHIS) ? 0 : CORINFO_FLG_STATIC;
 
-
+#ifdef DEBUG
+        if (verbose)
+        {
+            unsigned structSize = (callRetTyp == TYP_STRUCT) ? info.compCompHnd->getClassSize(calliSig.retTypeSigClass) : 0;
+            printf("\nIn Compiler::impImportCall: opcode is %s, kind=%d, callRetType is %s, structSize is %d\n", 
+                   opcodeNames[opcode], callInfo->kind, varTypeName(callRetTyp), structSize);
+        }
+#endif
         //This should be checked in impImportBlockCode.
         assert(!compIsForInlining()
                || !(impInlineInfo->inlineCandidateInfo->dwRestrictions & INLINE_RESPECT_BOUNDARY));
@@ -6021,6 +6036,14 @@ var_types  Compiler::impImportCall(OPCODE                  opcode,
 
         mflags   = callInfo->methodFlags;
 
+#ifdef DEBUG
+        if (verbose)
+        {
+            unsigned structSize = (callRetTyp == TYP_STRUCT) ? info.compCompHnd->getClassSize(sig->retTypeSigClass) : 0;
+            printf("\nIn Compiler::impImportCall: opcode is %s, kind=%d, callRetType is %s, structSize is %d\n", 
+                   opcodeNames[opcode], callInfo->kind, varTypeName(callRetTyp), structSize);
+        }
+#endif
         if (compIsForInlining())
         {
             /* Does this call site have security boundary restrictions? */
@@ -6807,7 +6830,7 @@ var_types  Compiler::impImportCall(OPCODE                  opcode,
     //-------------------------------------------------------------------------
     // The "this" pointer
 
-    if (!(mflags & CORINFO_FLG_STATIC) || opcode == CEE_NEWOBJ)
+    if (!(mflags & CORINFO_FLG_STATIC) && !((opcode == CEE_NEWOBJ) && (newobjThis == nullptr)))
     {
         GenTreePtr obj;
 
@@ -7170,7 +7193,7 @@ DONE_CALL:
             }
             else if (varTypeIsLong(callRetTyp))
             {
-                call = impFixupCallLongReturn(call, sig->retTypeClass);
+                call = impInitCallLongReturn(call);
             }
 
             if ((call->gtFlags & GTF_CALL_INLINE_CANDIDATE) != 0)
@@ -7219,63 +7242,23 @@ DONE_CALL:
 
 bool  Compiler::impMethodInfo_hasRetBuffArg(CORINFO_METHOD_INFO * methInfo)
 {
-    if (methInfo->args.retType != CORINFO_TYPE_VALUECLASS && methInfo->args.retType != CORINFO_TYPE_REFANY)
+    CorInfoType  corType = methInfo->args.retType;
+    
+    if ((corType == CORINFO_TYPE_VALUECLASS) ||(corType == CORINFO_TYPE_REFANY))
     {
-        return false;
+        // We have some kind of STRUCT being returned
+
+        structPassingKind howToReturnStruct = SPK_Unknown;
+
+        var_types  returnType = getReturnTypeForStruct(methInfo->args.retTypeClass, &howToReturnStruct);
+
+        if (howToReturnStruct == SPK_ByReference)
+        {
+            return true;
+        }
     }
 
-#if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-    assert(!info.compIsVarArgs && "Varargs not supported in CoreCLR on Unix.");
-    if (IsRegisterPassable(methInfo->args.retTypeClass))
-    {
-        return false;
-    }
-
-    // The struct is not aligned properly or it is bigger than 16 bytes,
-    // or it is custom layout, or it is not passed in registers for any other reason.
-    return true;
-#elif defined(_TARGET_XARCH_)
-    // On Amd64 and x86 only we don't need a return buffer if:
-    //
-    //   i) TYP_STRUCT argument that can fit into a single register and
-    //  ii) Power of two sized TYP_STRUCT.
-    //
-    unsigned size = info.compCompHnd->getClassSize(methInfo->args.retTypeClass);
-    if ((size <= TARGET_POINTER_SIZE) && isPow2(size))
-    {
-        return false;
-    }
-#else
-    // Generally we don't need a return buffer if:
-    //   i) TYP_STRUCT argument that can fit into a single register 
-    // The power of two size requirement only applies for Amd64 and x86.
-    //
-
-     unsigned size = info.compCompHnd->getClassSize(methInfo->args.retTypeClass);
-    if (size <= TARGET_POINTER_SIZE) 
-    {
-        return false;
-    }
-#endif
-
-#if FEATURE_MULTIREG_RET
-
-    // Support for any additional cases that don't use a Return Buffer Argument
-    //  on targets that support multi-reg return valuetypes.
-    //
-  #ifdef FEATURE_HFA
-    // On ARM HFAs are returned in registers.
-    if (!info.compIsVarArgs && IsHfa(methInfo->args.retTypeClass))
-    {
-        return false;
-    }
-  #endif // FEATURE_HFA
-
-#endif // FEATURE_MULTIREG_RET
-
-    // Otherwise we require that a RetBuffArg be used
-    return true;
-
+    return false;
 }
 
 #ifdef DEBUG
@@ -7361,38 +7344,15 @@ GenTreePtr                Compiler::impFixupCallStructReturn(GenTreePtr     call
 
     call->gtCall.gtRetClsHnd = retClsHnd;
 
-#if FEATURE_MULTIREG_RET && defined(FEATURE_HFA)
-    // There is no fixup necessary if the return type is a HFA struct.
-    // HFA structs are returned in registers for ARM32 and ARM64
-    //
-    if (!call->gtCall.IsVarargs() && IsHfa(retClsHnd))
-    {
-        if (call->gtCall.CanTailCall())
-        {
-            if (info.compIsVarArgs)
-            {
-                // We cannot tail call because control needs to return to fixup the calling
-                // convention for result return.
-                call->gtCall.gtCallMoreFlags &= ~GTF_CALL_M_EXPLICIT_TAILCALL;
-            }
-            else
-            {
-                // If we can tail call returning HFA, then don't assign it to
-                // a variable back and forth.
-                return call;
-            }
-        }
-
-        if (call->gtFlags & GTF_CALL_INLINE_CANDIDATE)
-        {
-            return call;
-        }
-
-        return impAssignMultiRegTypeToVar(call, retClsHnd);
-    }
-#elif defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-
     GenTreeCall* callNode = call->AsCall();
+
+#if FEATURE_MULTIREG_RET
+    // Initialize Return type descriptor of call node    
+    ReturnTypeDesc* retTypeDesc = callNode->GetReturnTypeDesc();
+    retTypeDesc->InitializeStructReturnType(this, retClsHnd);
+#endif // FEATURE_MULTIREG_RET
+
+#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
 
     // Not allowed for FEATURE_CORCLR which is the only SKU available for System V OSs.
     assert(!callNode->IsVarargs() && "varargs not allowed for System V OSs.");
@@ -7400,10 +7360,6 @@ GenTreePtr                Compiler::impFixupCallStructReturn(GenTreePtr     call
     // The return type will remain as the incoming struct type unless normalized to a
     // single eightbyte return type below.
     callNode->gtReturnType = call->gtType;
-
-    // Initialize Return type descriptor of call node    
-    ReturnTypeDesc* retTypeDesc = callNode->GetReturnTypeDesc();
-    retTypeDesc->Initialize(this, retClsHnd);
 
     unsigned retRegCount = retTypeDesc->GetReturnRegCount();
     if (retRegCount != 0)
@@ -7436,72 +7392,119 @@ GenTreePtr                Compiler::impFixupCallStructReturn(GenTreePtr     call
         callNode->gtCallMoreFlags |= GTF_CALL_M_RETBUFFARG;
     }
 
-    return call;
-#endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
+#else // not FEATURE_UNIX_AMD64_STRUCT_PASSING
 
-    // Check for TYP_STRUCT argument that can fit into a single register
-    // change the type on those trees.
-    var_types regType = argOrReturnTypeForStruct(retClsHnd, true);
-    if (regType != TYP_UNKNOWN)
+#if FEATURE_MULTIREG_RET && defined(_TARGET_ARM_)
+    // There is no fixup necessary if the return type is a HFA struct.
+    // HFA structs are returned in registers for ARM32 and ARM64
+    //
+    if (!call->gtCall.IsVarargs() && IsHfa(retClsHnd))
     {
-        call->gtCall.gtReturnType = regType;
+        if (call->gtCall.CanTailCall())
+        {
+            if (info.compIsVarArgs)
+            {
+                // We cannot tail call because control needs to return to fixup the calling
+                // convention for result return.
+                call->gtCall.gtCallMoreFlags &= ~GTF_CALL_M_EXPLICIT_TAILCALL;
+            }
+            else
+            {
+                // If we can tail call returning HFA, then don't assign it to
+                // a variable back and forth.
+                return call;
+            }
+        }
+
+        if (call->gtFlags & GTF_CALL_INLINE_CANDIDATE)
+        {
+            return call;
+        }
+
+        return impAssignMultiRegTypeToVar(call, retClsHnd);
+    }
+#endif // _TARGET_ARM_
+
+    // Check for TYP_STRUCT type that wraps a primitive type
+    // Such structs are returned using a single register 
+    // and we change the return type on those calls here.
+    //
+    structPassingKind howToReturnStruct;
+    var_types returnType = getReturnTypeForStruct(retClsHnd, &howToReturnStruct);
+
+    if (howToReturnStruct == SPK_ByReference)
+    {
+        assert(returnType == TYP_UNKNOWN);
+        call->gtCall.gtCallMoreFlags |= GTF_CALL_M_RETBUFFARG;
     }
     else
     {
-        call->gtCall.gtCallMoreFlags |= GTF_CALL_M_RETBUFFARG; 
+        assert(returnType != TYP_UNKNOWN);
+        call->gtCall.gtReturnType = returnType;
+
+        // ToDo: Refactor this common code sequence into its own method as it is used 4+ times
+        if ((returnType == TYP_LONG) && (compLongUsed == false))
+            compLongUsed = true;
+        else if (((returnType == TYP_FLOAT) || (returnType == TYP_DOUBLE)) && (compFloatingPointUsed == false))
+            compFloatingPointUsed = true;
+
+#if FEATURE_MULTIREG_RET
+        unsigned retRegCount = retTypeDesc->GetReturnRegCount();
+        assert(retRegCount != 0);
+
+        if (retRegCount >= 2)
+        {
+            if ((!callNode->CanTailCall()) && (!callNode->IsInlineCandidate()))
+            {
+                // Force a call returning multi-reg struct to be always of the IR form
+                //   tmp = call
+                //
+                // No need to assign a multi-reg struct to a local var if:
+                //  - It is a tail call or 
+                //  - The call is marked for in-lining later
+                return impAssignMultiRegTypeToVar(call, retClsHnd);
+            }
+        }
+#endif // FEATURE_MULTIREG_RET
+
     }
+
+#endif // not FEATURE_UNIX_AMD64_STRUCT_PASSING
 
     return call;
 }
 
 
-//-----------------------------------------------------------------------------------
-//  impFixupCallLongReturn: For a call node that returns a long type, force the call
-//  to always be in the IR form tmp = call
+//-------------------------------------------------------------------------------------
+//  impInitCallLongReturn: 
+//     Initialize the ReturnTypDesc for a call that returns a TYP_LONG
 //
 //  Arguments:
 //    call       -  GT_CALL GenTree node
-//    retClsHnd  -  Class handle of return type of the call
 //
 //  Return Value:
-//    Returns new GenTree node after fixing long return of call node
+//    Returns new GenTree node after initializing the ReturnTypeDesc of call node
 //
-GenTreePtr                Compiler::impFixupCallLongReturn(GenTreePtr     call,
-                                                           CORINFO_CLASS_HANDLE retClsHnd)
+GenTreePtr                Compiler::impInitCallLongReturn(GenTreePtr     call)
 {
-#if defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
-    // LEGACY_BACKEND does not use multi reg returns for calls with long return types
     assert(call->gtOper == GT_CALL);
 
-    if (!varTypeIsLong(call))
+#if defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
+    // LEGACY_BACKEND does not use multi reg returns for calls with long return types
+
+    if (varTypeIsLong(call))
     {
-        return call;
-    }
+        GenTreeCall* callNode = call->AsCall();
 
-    call->gtCall.gtRetClsHnd = retClsHnd;
+        // The return type will remain as the incoming long type
+        callNode->gtReturnType = call->gtType;
 
-    GenTreeCall* callNode = call->AsCall();
+        // Initialize Return type descriptor of call node
+        ReturnTypeDesc* retTypeDesc = callNode->GetReturnTypeDesc();
+        retTypeDesc->InitializeLongReturnType(this);
 
-    // The return type will remain as the incoming long type
-    callNode->gtReturnType = call->gtType;
-
-    // Initialize Return type descriptor of call node
-    ReturnTypeDesc* retTypeDesc = callNode->GetReturnTypeDesc();
-    retTypeDesc->Initialize(this, retClsHnd);
-
-    unsigned retRegCount = retTypeDesc->GetReturnRegCount();
-    // must be a long returned in two registers
-    assert(retRegCount == 2);
-
-    if ((!callNode->CanTailCall()) && (!callNode->IsInlineCandidate()))
-    {
-        // Force a call returning multi-reg long to be always of the IR form
-        //   tmp = call
-        //
-        // No need to assign a multi-reg long to a local var if:
-        //  - It is a tail call or 
-        //  - The call is marked for in-lining later
-        return impAssignMultiRegTypeToVar(call, retClsHnd);
+        // must be a long returned in two registers
+        assert(retTypeDesc->GetReturnRegCount() == 2);
     }
 #endif // _TARGET_X86_ && !LEGACY_BACKEND
 
@@ -7536,7 +7539,7 @@ GenTreePtr          Compiler::impFixupStructReturnType(GenTreePtr op, CORINFO_CL
         {
             // Make sure that this struct stays in memory and doesn't get promoted.
             unsigned lclNum = op->gtLclVarCommon.gtLclNum;
-            lvaTable[lclNum].lvIsMultiRegArgOrRet = true;
+            lvaTable[lclNum].lvIsMultiRegRet = true;
 
             return op;
         }
@@ -7552,7 +7555,8 @@ GenTreePtr          Compiler::impFixupStructReturnType(GenTreePtr op, CORINFO_CL
     assert(info.compRetNativeType != TYP_STRUCT);
 #endif // !FEATURE_UNIX_AMD64_STRUCT_PASSING
 
-#elif FEATURE_MULTIREG_RET && defined(FEATURE_HFA)
+#elif FEATURE_MULTIREG_RET && defined(_TARGET_ARM_)
+
     if (!info.compIsVarArgs && IsHfa(retClsHnd))
     {
         if (op->gtOper == GT_LCL_VAR)
@@ -7560,7 +7564,7 @@ GenTreePtr          Compiler::impFixupStructReturnType(GenTreePtr op, CORINFO_CL
             // This LCL_VAR is an HFA return value, it stays as a TYP_STRUCT
             unsigned lclNum = op->gtLclVarCommon.gtLclNum;
             // Make sure this struct type stays as struct so that we can return it as an HFA
-            lvaTable[lclNum].lvIsMultiRegArgOrRet = true;
+            lvaTable[lclNum].lvIsMultiRegRet = true;
             return op;
         }
          
@@ -7580,6 +7584,39 @@ GenTreePtr          Compiler::impFixupStructReturnType(GenTreePtr op, CORINFO_CL
         }
         return impAssignMultiRegTypeToVar(op, retClsHnd);
     }
+
+#elif FEATURE_MULTIREG_RET && defined(_TARGET_ARM64_)
+
+    // Is method returning a multi-reg struct?
+    if (IsMultiRegReturnedType(retClsHnd))
+    {
+        if (op->gtOper == GT_LCL_VAR)
+        {
+            // This LCL_VAR stays as a TYP_STRUCT
+            unsigned lclNum = op->gtLclVarCommon.gtLclNum;
+
+            // Make sure this struct type is not struct promoted
+            lvaTable[lclNum].lvIsMultiRegRet = true;
+            return op;
+        }
+
+        if (op->gtOper == GT_CALL)
+        {
+            if (op->gtCall.IsVarargs())
+            {
+                // We cannot tail call because control needs to return to fixup the calling
+                // convention for result return.
+                op->gtCall.gtCallMoreFlags &= ~GTF_CALL_M_TAILCALL;
+                op->gtCall.gtCallMoreFlags &= ~GTF_CALL_M_EXPLICIT_TAILCALL;
+            }
+            else
+            {
+                return op;
+            }
+        }
+        return impAssignMultiRegTypeToVar(op, retClsHnd);
+    }
+
 #endif //  FEATURE_MULTIREG_RET && FEATURE_HFA
 
 REDO_RETURN_NODE:
@@ -7736,6 +7773,14 @@ void                Compiler::impImportLeave(BasicBlock * block)
                                            endCatches, endCatch);
             else
                 endCatches = endCatch;
+
+#ifdef DEBUG
+            if (verbose)
+            {
+                printf("impImportLeave - BB%02u jumping out of catch handler EH#%u, adding call to CORINFO_HELP_ENDCATCH\n",
+                    block->bbNum, XTnum);
+            }
+#endif
         }
         else if (HBtab->HasFinallyHandler() &&
                   jitIsBetween(blkAddr, tryBeg, tryEnd)    &&
@@ -10033,10 +10078,11 @@ ARR_LD_POST_VERIFY:
 
             /* Mark the block as containing an index expression */
 
-            if  (op1->gtOper == GT_LCL_VAR)
+            if (op1->gtOper == GT_LCL_VAR)
             {
-                if  (op2->gtOper == GT_LCL_VAR ||
-                     op2->gtOper == GT_ADD)
+                if (op2->gtOper == GT_LCL_VAR ||
+                    op2->gtOper == GT_CNS_INT ||
+                    op2->gtOper == GT_ADD)
                 {
                     block->bbFlags |= BBF_HAS_INDX;
                     optMethodFlags |= OMF_HAS_ARRAYREF;
@@ -10261,10 +10307,11 @@ ARR_LD_POST_VERIFY:
 
             // Mark the block as containing an index expression
 
-            if  (op3->gtOper == GT_LCL_VAR)
+            if (op3->gtOper == GT_LCL_VAR)
             {
-                if  (op1->gtOper == GT_LCL_VAR ||
-                     op1->gtOper == GT_ADD)
+                if (op1->gtOper == GT_LCL_VAR ||
+                    op1->gtOper == GT_CNS_INT ||
+                    op1->gtOper == GT_ADD)
                 {
                     block->bbFlags |= BBF_HAS_INDX;
                     optMethodFlags |= OMF_HAS_ARRAYREF;
@@ -11095,6 +11142,7 @@ _CONV:
                 // Since we are throwing away the value, just normalize
                 // it to its address.  This is more efficient.
 
+
                 if (varTypeIsStruct(op1))
                 {                    
 #ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
@@ -11102,10 +11150,12 @@ _CONV:
                     // Calls with large struct return value have to go through this.
                     // Helper calls with small struct return value also have to go 
                     // through this since they do not follow Unix calling convention.
-                    if (op1->gtOper != GT_CALL || !IsRegisterPassable(clsHnd) 
+                    if (op1->gtOper != GT_CALL || !IsMultiRegReturnedType(clsHnd)
                        || op1->AsCall()->gtCallType == CT_HELPER)
 #endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
-                    op1 = impGetStructAddr(op1, clsHnd, (unsigned)CHECK_SPILL_ALL, false);
+                    {
+                        op1 = impGetStructAddr(op1, clsHnd, (unsigned)CHECK_SPILL_ALL, false);
+                    }
                 }
 
                 // If op1 is non-overflow cast, throw it away since it is useless.
@@ -11686,10 +11736,18 @@ DO_LDFTN:
             // At present this can only be String
             else if (clsFlags & CORINFO_FLG_VAROBJSIZE)
             {
-                // This is the case for variable-sized objects that are not
-                // arrays.  In this case, call the constructor with a null 'this'
-                // pointer
-                newObjThisPtr = gtNewIconNode(0, TYP_REF);
+                if (eeGetEEInfo()->targetAbi == CORINFO_CORERT_ABI)
+                {
+                    // The dummy argument does not exist in CoreRT
+                    newObjThisPtr = nullptr;
+                }
+                else
+                {
+                    // This is the case for variable-sized objects that are not
+                    // arrays.  In this case, call the constructor with a null 'this'
+                    // pointer
+                    newObjThisPtr = gtNewIconNode(0, TYP_REF);
+                }
 
                 /* Remember that this basic block contains 'new' of an object */
                 block->bbFlags |= BBF_HAS_NEWOBJ;
@@ -13145,56 +13203,48 @@ FIELD_DONE:
 
                 assert(helper == CORINFO_HELP_UNBOX_NULLABLE && "Make sure the helper is nullable!");
 
-#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-                if (varTypeIsStruct(op1))
+#if FEATURE_MULTIREG_RET
+
+                if (varTypeIsStruct(op1) && IsMultiRegReturnedType(resolvedToken.hClass))
                 {
-                    if (IsMultiRegReturnedType(resolvedToken.hClass))
-                    {
-                        // Unbox nullable helper returns a TYP_STRUCT.
-                        // We need to spill it to a temp so than we can take the address of it.
-                        // We need the temp so we can pass its address to the unbox_nullable jit helper function.
-                        // This is needed for nullables returned in 2 registers.
-                        // The ones returned in a single register are normalized.
-                        // For the bigger than 16 bytes nullables there is retbuf already passed in 
-                        // rdi/rsi (depending whether there is a "this").
+                    // Unbox nullable helper returns a TYP_STRUCT.
+                    // For the multi-reg case we need to spill it to a temp so that 
+                    // we can pass the address to the unbox_nullable jit helper.
 
-                        unsigned   tmp = lvaGrabTemp(true DEBUGARG("UNBOXing a register returnable nullable"));
-                        lvaTable[tmp].lvIsMultiRegArgOrRet = true;
-                        lvaSetStruct(tmp, resolvedToken.hClass, true  /* unsafe value cls check */);
+                    unsigned   tmp = lvaGrabTemp(true DEBUGARG("UNBOXing a register returnable nullable"));
+                    lvaTable[tmp].lvIsMultiRegArg = true;
+                    lvaSetStruct(tmp, resolvedToken.hClass, true  /* unsafe value cls check */);
 
-                        op2 = gtNewLclvNode(tmp, TYP_STRUCT);
-                        op1 = impAssignStruct(op2, op1, resolvedToken.hClass, (unsigned)CHECK_SPILL_ALL);
-                        assert(op1->gtType == TYP_VOID); // We must be assigning the return struct to the temp.
+                    op2 = gtNewLclvNode(tmp, TYP_STRUCT);
+                    op1 = impAssignStruct(op2, op1, resolvedToken.hClass, (unsigned)CHECK_SPILL_ALL);
+                    assert(op1->gtType == TYP_VOID); // We must be assigning the return struct to the temp.
 
-                        op2 = gtNewLclvNode(tmp, TYP_STRUCT);
-                        op2 = gtNewOperNode(GT_ADDR, TYP_BYREF, op2);
-                        op1 = gtNewOperNode(GT_COMMA, TYP_BYREF, op1, op2);
+                    op2 = gtNewLclvNode(tmp, TYP_STRUCT);
+                    op2 = gtNewOperNode(GT_ADDR, TYP_BYREF, op2);
+                    op1 = gtNewOperNode(GT_COMMA, TYP_BYREF, op1, op2);
 
-                        // In this case the return value of the unbox helper is TYP_BYREF.
-                        // Make sure the right type is placed on the operand type stack.
-                        impPushOnStack(op1, tiRetVal);
+                    // In this case the return value of the unbox helper is TYP_BYREF.
+                    // Make sure the right type is placed on the operand type stack.
+                    impPushOnStack(op1, tiRetVal);
 
-                        // Load the struct.
-                        oper = GT_OBJ;
+                    // Load the struct.
+                    oper = GT_OBJ;
 
-                        assert(op1->gtType == TYP_BYREF);
-                        assert(!tiVerificationNeeded || tiRetVal.IsByRef());
+                    assert(op1->gtType == TYP_BYREF);
+                    assert(!tiVerificationNeeded || tiRetVal.IsByRef());
 
-                        goto OBJ;
-                    }   
-                    else
-                    {
-                        // If non register passable struct we have it materialized in the RetBuf.
-                        assert(op1->gtType == TYP_STRUCT);
-                        tiRetVal = verMakeTypeInfo(resolvedToken.hClass);
-                        assert(tiRetVal.IsValueClass());
-                    }
-                }                
-#else // !defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-                assert(op1->gtType == TYP_STRUCT);
-                tiRetVal = verMakeTypeInfo(resolvedToken.hClass);
-                assert(tiRetVal.IsValueClass());                       
-#endif // !defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+                    goto OBJ;
+                }   
+                else
+                     
+#endif // !FEATURE_MULTIREG_RET
+
+                {
+                    // If non register passable struct we have it materialized in the RetBuf.
+                    assert(op1->gtType == TYP_STRUCT);
+                    tiRetVal = verMakeTypeInfo(resolvedToken.hClass);
+                    assert(tiRetVal.IsValueClass());
+                }
             }
 
             impPushOnStack(op1, tiRetVal);                    
@@ -13968,7 +14018,7 @@ void Compiler::impMarkLclDstNotPromotable(unsigned tmpNum, GenTreePtr src, CORIN
             (hfaType == TYP_FLOAT && hfaSlots == sizeof(float) / REGSIZE_BYTES))
         {
             // Make sure this struct type stays as struct so we can receive the call in a struct.
-            lvaTable[tmpNum].lvIsMultiRegArgOrRet = true;
+            lvaTable[tmpNum].lvIsMultiRegRet = true;
         }
     }
 }
@@ -13980,17 +14030,10 @@ GenTreePtr Compiler::impAssignMultiRegTypeToVar(GenTreePtr op, CORINFO_CLASS_HAN
     unsigned tmpNum = lvaGrabTemp(true DEBUGARG("Return value temp for multireg return."));
     impAssignTempGen(tmpNum, op, hClass, (unsigned)CHECK_SPILL_NONE);
     GenTreePtr ret = gtNewLclvNode(tmpNum, op->gtType);
-
-#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING 
-    // If single eightbyte, the return type would have been normalized and there won't be a temp var.
-    // This code will be called only if the struct return has not been normalized (i.e. 2 eightbytes - max allowed.)
     assert(IsMultiRegReturnedType(hClass));
 
     // Mark the var so that fields are not promoted and stay together.
-    lvaTable[tmpNum].lvIsMultiRegArgOrRet = true;
-#elif defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
-    lvaTable[tmpNum].lvIsMultiRegArgOrRet = true;
-#endif // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+    lvaTable[tmpNum].lvIsMultiRegRet = true;
 
     return ret;
 }
@@ -14235,7 +14278,7 @@ bool Compiler::impReturnInstruction(BasicBlock *block, int prefixFlags, OPCODE &
                     // Same as !IsHfa but just don't bother with impAssignStructPtr.
 #else // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
                 ReturnTypeDesc retTypeDesc;
-                retTypeDesc.Initialize(this, retClsHnd);
+                retTypeDesc.InitializeStructReturnType(this, retClsHnd);
                 unsigned retRegCount = retTypeDesc.GetReturnRegCount();
 
                 if (retRegCount != 0)
@@ -14265,13 +14308,20 @@ bool Compiler::impReturnInstruction(BasicBlock *block, int prefixFlags, OPCODE &
                 }
                 else
 #elif defined(_TARGET_ARM64_)
-                if (!iciCall->AsCall()->HasRetBufArg())
+                ReturnTypeDesc retTypeDesc;
+                retTypeDesc.InitializeStructReturnType(this, retClsHnd);
+                unsigned retRegCount = retTypeDesc.GetReturnRegCount();
+
+                if (retRegCount != 0)
                 {
+                    assert(!iciCall->AsCall()->HasRetBufArg());
+                    assert(retRegCount >= 2);
                     if (lvaInlineeReturnSpillTemp != BAD_VAR_NUM)
                     {
                         if (!impInlineInfo->retExpr)
                         {
-                            impInlineInfo->retExpr = gtNewLclvNode(lvaInlineeReturnSpillTemp, TYP_STRUCT);
+                            // The inlinee compiler has figured out the type of the temp already. Use it here.
+                            impInlineInfo->retExpr = gtNewLclvNode(lvaInlineeReturnSpillTemp, lvaTable[lvaInlineeReturnSpillTemp].lvType);
                         }
                     }
                     else

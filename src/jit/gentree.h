@@ -495,11 +495,18 @@ public:
 
     bool isContainedLclField() const        { return isContained() && isLclField(); }
 
+    bool isContainedLclVar() const          { return isContained() && (OperGet() == GT_LCL_VAR);  } 
+
+    bool isContainedSpillTemp() const;
+
     // Indicates whether it is a memory op.
     // Right now it includes Indir and LclField ops.
     bool isMemoryOp() const                 { return isIndir() || isLclField(); }
 
-    bool isContainedMemoryOp() const        { return isContained() && isMemoryOp(); }
+    bool isContainedMemoryOp() const        
+    { 
+        return (isContained() && isMemoryOp()) || isContainedLclVar() || isContainedSpillTemp(); 
+    }
 
     regNumber GetRegNum() const
     {
@@ -560,7 +567,11 @@ public:
     regMaskTP gtGetRegMask() const;
 
     unsigned            gtFlags;        // see GTF_xxxx below
-    
+
+#if defined(DEBUG)
+    unsigned            gtDebugFlags;   // see GTF_DEBUG_xxx below
+#endif // defined(DEBUG)
+
     ValueNumPair        gtVNPair;
 
     regMaskSmall        gtRsvdRegs;     // set of fixed trashed  registers
@@ -631,11 +642,14 @@ public:
     #define GTF_GLOB_EFFECT     (GTF_SIDE_EFFECT|GTF_GLOB_REF)
     #define GTF_ALL_EFFECT      (GTF_GLOB_EFFECT|GTF_ORDER_SIDEEFF)
 
-    // The extra flag GTF_DEAD is used to tell the consumer of these flags
-    // that we are calling in the context of performing a CSE, thus we 
+    // The extra flag GTF_IS_IN_CSE is used to tell the consumer of these flags
+    // that we are calling in the context of performing a CSE, thus we
     // should allow the run-once side effects of running a class constructor.
     //
-    #define GTF_PERSISTENT_SIDE_EFFECTS_IN_CSE (GTF_ASG|GTF_CALL|GTF_DEAD)
+    // The only requirement of this flag is that it not overlap any of the
+    // side-effect flags. The actual bit used is otherwise arbitrary.
+    #define GTF_IS_IN_CSE  GTF_MAKE_CSE
+    #define GTF_PERSISTENT_SIDE_EFFECTS_IN_CSE (GTF_ASG|GTF_CALL|GTF_IS_IN_CSE)
 
     // Can any side-effects be observed externally, say by a caller method?
     // For assignments, only assignments to global memory can be observed
@@ -653,22 +667,14 @@ public:
     #define GTF_REVERSE_OPS     0x00000020  // operand op2 should be evaluated before op1 (normally, op1 is evaluated first and op2 is evaluated second)
     #define GTF_REG_VAL         0x00000040  // operand is sitting in a register (or part of a TYP_LONG operand is sitting in a register)
 
-    #define GTF_SPILLED         0x00000080  // the value   has been spilled
-    #define GTF_SPILLED_OPER    0x00000100  //   op1 has been spilled
+    #define GTF_SPILLED         0x00000080  // the value has been spilled
 
 #ifdef LEGACY_BACKEND
-    #define GTF_SPILLED_OP2     0x00000200  //   op2 has been spilled
+    #define GTF_SPILLED_OPER    0x00000100  // op1 has been spilled
+    #define GTF_SPILLED_OP2     0x00000200  // op2 has been spilled
+#else
+    #define GTF_NOREG_AT_USE    0x00000100  // tree node is in memory at the point of use
 #endif // LEGACY_BACKEND
-
-#ifdef DEBUG
-#ifndef LEGACY_BACKEND
-    #define GTF_MORPHED         0x00000200  // the node has been morphed (in the global morphing phase)
-#else // LEGACY_BACKEND
-    // For LEGACY_BACKEND, 0x00000200 is in use, but we can use the same value as GTF_SPILLED since we
-    // don't call gtSetEvalOrder(), which clears GTF_MORPHED, after GTF_SPILLED has been set.
-    #define GTF_MORPHED         0x00000080  // the node has been morphed (in the global morphing phase)
-#endif // LEGACY_BACKEND
-#endif // DEBUG
 
     #define GTF_REDINDEX_CHECK  0x00000100  // Used for redundant range checks. Disjoint from GTF_SPILLED_OPER
 
@@ -679,23 +685,11 @@ public:
 #endif
     #define GTF_IND_NONFAULTING 0x00000800  // An indir that cannot fault.  GTF_SET_FLAGS is not used on indirs
 
-#if FEATURE_ANYCSE
-    #define GTF_DEAD            0x00001000  // this node won't be used any more
-#endif // FEATURE_ANYCSE
-
     #define GTF_MAKE_CSE        0x00002000  // Hoisted Expression: try hard to make this into CSE  (see optPerformHoistExpr)
     #define GTF_DONT_CSE        0x00004000  // don't bother CSE'ing this expr
     #define GTF_COLON_COND      0x00008000  // this node is conditionally executed (part of ? :)
 
-#if defined(DEBUG) && SMALL_TREE_NODES
-    #define GTF_NODE_LARGE      0x00010000
-    #define GTF_NODE_SMALL      0x00020000
-
-    // Property of the node itself, not the gtOper
-    #define GTF_NODE_MASK       (GTF_COLON_COND | GTF_MORPHED   | GTF_NODE_SMALL | GTF_NODE_LARGE )
-#else
     #define GTF_NODE_MASK       (GTF_COLON_COND)
-#endif
 
     #define GTF_BOOLEAN         0x00040000  // value is known to be 0/1
 
@@ -716,9 +710,7 @@ public:
                                             // code to produce the value.
                                             // It is currently used only on constant nodes.
                                             // It CANNOT be set on var (GT_LCL*) nodes, or on indir (GT_IND or GT_STOREIND) nodes, since
-                                            // 1) it is not needed for lclVars and is highly unlikely to be useful for indir nodes, and
-                                            // 2) it conflicts with GTFD_VAR_CSE_REF for lclVars (though this is debug only, and
-                                            //    GTF_IND_ARR_INDEX for indirs.
+                                            // it is not needed for lclVars and is highly unlikely to be useful for indir nodes
 
     //---------------------------------------------------------------------
     //  The following flags can be used only with a small set of nodes, and
@@ -764,10 +756,6 @@ public:
     #define GTF_CALL_REG_SAVE   0x01000000  // GT_CALL    -- This call preserves all integer regs
                                             // For additional flags for GT_CALL node see GTF_CALL_M_
 
-#ifdef DEBUG
-    #define GTFD_VAR_CSE_REF    0x00800000  // GT_LCL_VAR -- This is a CSE LCL_VAR node
-#endif
-
     #define GTF_NOP_DEATH         0x40000000  // GT_NOP     -- operand dies here
 
     #define GTF_FLD_NULLCHECK     0x80000000  // GT_FIELD -- need to nullcheck the "this" pointer
@@ -785,8 +773,7 @@ public:
     #define GTF_IND_UNALIGNED     0x02000000  // GT_IND   -- the load or store is unaligned (we assume worst case alignment of 1 byte) 
     #define GTF_IND_INVARIANT     0x01000000  // GT_IND   -- the target is invariant (a prejit indirection)
     #define GTF_IND_ARR_LEN       0x80000000  // GT_IND   -- the indirection represents an array length (of the REF contribution to its argument).
-    #define GTF_IND_ARR_INDEX     0x00800000  // GT_IND   -- the indirection represents an (SZ) array index (this shares the same value as GTFD_VAR_CSE_REF,
-                                              //             but is disjoint because a GT_LCL_VAR is never an ind (GT_IND or GT_STOREIND)
+    #define GTF_IND_ARR_INDEX     0x00800000  // GT_IND   -- the indirection represents an (SZ) array index
 
     #define GTF_IND_FLAGS         (GTF_IND_VOLATILE|GTF_IND_REFARR_LAYOUT|GTF_IND_TGTANYWHERE|GTF_IND_NONFAULTING|\
                                    GTF_IND_TLS_REF|GTF_IND_UNALIGNED|GTF_IND_INVARIANT|GTF_IND_ARR_INDEX)
@@ -857,6 +844,18 @@ public:
 
     //----------------------------------------------------------------
 
+#if defined(DEBUG)
+    #define GTF_DEBUG_NONE            0x00000000  // No debug flags.
+
+    #define GTF_DEBUG_NODE_MORPHED    0x00000001  // the node has been morphed (in the global morphing phase)
+    #define GTF_DEBUG_NODE_SMALL      0x00000002
+    #define GTF_DEBUG_NODE_LARGE      0x00000004
+
+    #define GTF_DEBUG_NODE_MASK       0x00000007  // These flags are all node (rather than operation) properties.
+
+    #define GTF_DEBUG_VAR_CSE_REF     0x00800000  // GT_LCL_VAR -- This is a CSE LCL_VAR node
+#endif // defined(DEBUG)
+
     GenTreePtr          gtNext;
     GenTreePtr          gtPrev;
 
@@ -895,29 +894,29 @@ public:
     }
 
     static
-    int             OperIsConst(genTreeOps gtOper)
+    bool            OperIsConst(genTreeOps gtOper)
     {
         return  (OperKind(gtOper) & GTK_CONST  ) != 0;
     }
 
-    int             OperIsConst() const
+    bool            OperIsConst() const
     {
         return  (OperKind(gtOper) & GTK_CONST  ) != 0;
     }
 
     static
-    int             OperIsLeaf(genTreeOps gtOper)
+    bool            OperIsLeaf(genTreeOps gtOper)
     {
         return  (OperKind(gtOper) & GTK_LEAF   ) != 0;
     }
 
-    int             OperIsLeaf() const
+    bool            OperIsLeaf() const
     {
         return  (OperKind(gtOper) & GTK_LEAF   ) != 0;
     }
 
     static
-    int             OperIsCompare(genTreeOps gtOper)
+    bool            OperIsCompare(genTreeOps gtOper)
     {
         return  (OperKind(gtOper) & GTK_RELOP  ) != 0;
     }
@@ -992,15 +991,10 @@ public:
         return (gtOper == GT_LEA);
     }
 
-    bool            OperIsBlkOp() const
-    {
-        return OperIsBlkOp(OperGet());
-    }
-
-    bool            OperIsCopyBlkOp() const
-    {
-        return OperIsCopyBlkOp(OperGet());
-    }
+    bool            OperIsBlkOp() const;
+    bool            OperIsCopyBlkOp() const;
+    bool            OperIsInitBlkOp() const;
+    bool            OperIsDynBlkOp();
 
     bool            OperIsPutArgStk() const
     {
@@ -1042,18 +1036,18 @@ public:
         return OperIsLocalRead(OperGet());
     }
 
-    int             OperIsCompare()
+    bool            OperIsCompare()
     {
         return  (OperKind(gtOper) & GTK_RELOP  ) != 0;
     }
 
     static
-    int             OperIsLogical(genTreeOps gtOper)
+    bool            OperIsLogical(genTreeOps gtOper)
     {
         return  (OperKind(gtOper) & GTK_LOGOP  ) != 0;
     }
 
-    int             OperIsLogical() const
+    bool            OperIsLogical() const
     {
         return  (OperKind(gtOper) & GTK_LOGOP  ) != 0;
     }
@@ -1095,7 +1089,7 @@ public:
         return OperIsShiftOrRotate(OperGet());
     }
 
-    int             OperIsArithmetic() const
+    bool            OperIsArithmetic() const
     {
         genTreeOps op = OperGet();
         return     op==GT_ADD
@@ -1138,40 +1132,40 @@ public:
 #endif // !defined(LEGACY_BACKEND) && !defined(_TARGET_64BIT_)
 
     static
-    int             OperIsUnary(genTreeOps gtOper)
+    bool            OperIsUnary(genTreeOps gtOper)
     {
         return  (OperKind(gtOper) & GTK_UNOP   ) != 0;
     }
 
-    int             OperIsUnary() const
+    bool            OperIsUnary() const
     {
         return   OperIsUnary(gtOper);
     }
 
     static
-    int             OperIsBinary(genTreeOps gtOper)
+    bool            OperIsBinary(genTreeOps gtOper)
     {
         return  (OperKind(gtOper) & GTK_BINOP  ) != 0;
     }
 
-    int             OperIsBinary() const
+    bool            OperIsBinary() const
     {
         return   OperIsBinary(gtOper);
     }
 
     static
-    int             OperIsSimple(genTreeOps gtOper)
+    bool            OperIsSimple(genTreeOps gtOper)
     {
         return (OperKind(gtOper) & GTK_SMPOP  ) != 0;
     }
 
     static
-    int             OperIsSpecial(genTreeOps gtOper)
+    bool            OperIsSpecial(genTreeOps gtOper)
     {        
         return  ((OperKind(gtOper) & GTK_KINDMASK) == GTK_SPECIAL);
     }
 
-    int             OperIsSimple() const
+    bool            OperIsSimple() const
     {
         return  OperIsSimple(gtOper);
     }
@@ -1186,34 +1180,34 @@ public:
 #endif // FEATURE_SIMD
 
     static
-    int             OperIsCommutative(genTreeOps gtOper)
+    bool            OperIsCommutative(genTreeOps gtOper)
     {
         return  (OperKind(gtOper) & GTK_COMMUTE) != 0;
     }
 
-    int             OperIsCommutative()
+    bool            OperIsCommutative()
     {
         return OperIsCommutative(gtOper) || (OperIsSIMD(gtOper) && isCommutativeSIMDIntrinsic());
     }
 
     static
-    int             OperIsAssignment(genTreeOps gtOper)
+    bool            OperIsAssignment(genTreeOps gtOper)
     {
         return  (OperKind(gtOper) & GTK_ASGOP) != 0;
     }
 
-    int             OperIsAssignment() const
+    bool            OperIsAssignment() const
     {
         return  OperIsAssignment(gtOper);
     }
 
     static
-    int             OperIsIndir(genTreeOps gtOper)
+    bool            OperIsIndir(genTreeOps gtOper)
     {
-        return  gtOper == GT_IND || gtOper == GT_STOREIND || gtOper == GT_NULLCHECK;
+        return  gtOper == GT_IND || gtOper == GT_STOREIND || gtOper == GT_NULLCHECK || gtOper == GT_OBJ;
     }
 
-    int             OperIsIndir() const
+    bool            OperIsIndir() const
     {
         return  OperIsIndir(gtOper);
     }
@@ -1260,7 +1254,7 @@ public:
     }
 
     static
-    int             OperIsAtomicOp(genTreeOps gtOper)
+    bool            OperIsAtomicOp(genTreeOps gtOper)
     {
         return  (gtOper == GT_XADD 
                  || gtOper == GT_XCHG  
@@ -1268,7 +1262,7 @@ public:
                  || gtOper == GT_CMPXCHG);
     }
 
-    int             OperIsAtomicOp()
+    bool            OperIsAtomicOp()
     {
         return  OperIsAtomicOp(gtOper);
     }
@@ -1478,6 +1472,10 @@ public:
     // yields an address into a local
     GenTreeLclVarCommon* IsLocalAddrExpr();
 
+    // Determine if this is a LclVarCommon node and return some additional info about it in the
+    // two out parameters.
+    bool IsLocalExpr(Compiler* comp, GenTreeLclVarCommon** pLclVarTree, FieldSeqNode** pFldSeq);
+
     // Determine whether this is an assignment tree of the form X = X (op) Y,
     // where Y is an arbitrary tree, and X is a lclVar.
     unsigned             IsLclVarUpdateTree(GenTree** otherTree, genTreeOps *updateOper);
@@ -1623,12 +1621,17 @@ public:
     bool                        gtRequestSetFlags   ();
 #ifdef DEBUG
     bool                        gtIsValid64RsltMul  ();
-    static int                  gtDispFlags         (unsigned flags);
+    static int                  gtDispFlags         (unsigned flags, unsigned debugFlags);
 #endif
 
     // cast operations 
     inline var_types            CastFromType();
     inline var_types&           CastToType();
+
+    // Returns true if this gentree node is marked by lowering to indicate
+    // that codegen can still generate code even if it wasn't allocated a 
+    // register.
+    bool IsRegOptional() const;   
 
     // Returns "true" iff "*this" is an assignment (GT_ASG) tree that defines an SSA name (lcl = phi(...));
     bool IsPhiDefn();
@@ -1960,6 +1963,8 @@ struct GenTreeIntCon: public GenTreeIntConCommon
         {
             assert(fields != NULL);
         }
+
+    void FixupInitBlkValue(var_types asgType);
 
 #ifdef _TARGET_64BIT_
     void TruncateOrSignExtend32()
@@ -2395,8 +2400,7 @@ enum class InlineObservation;
 struct ReturnTypeDesc
 {
 private:
-    var_types m_regType0;
-    var_types m_regType1;
+    var_types m_regType[MAX_RET_REG_COUNT];
 
 #ifdef DEBUG
     bool m_inited;
@@ -2408,15 +2412,20 @@ public:
         Reset();
     }
 
-    // Initialize type descriptor given its type handle
-    void Initialize(Compiler* comp, CORINFO_CLASS_HANDLE retClsHnd);
+    // Initialize the Return Type Descriptor for a method that returns a struct type
+    void InitializeStructReturnType(Compiler* comp, CORINFO_CLASS_HANDLE retClsHnd);
+
+    // Initialize the Return Type Descriptor for a method that returns a TYP_LONG
+    // Only needed for X86 
+    void InitializeLongReturnType(Compiler* comp);
 
     // Reset type descriptor to defaults
     void Reset()
     {
-        m_regType0 = TYP_UNKNOWN;
-        m_regType1 = TYP_UNKNOWN;
-
+        for (unsigned i = 0; i < MAX_RET_REG_COUNT; ++i)
+        {
+            m_regType[i] = TYP_UNKNOWN;
+        }
 #ifdef DEBUG
         m_inited = false;
 #endif
@@ -2436,20 +2445,24 @@ public:
         assert(m_inited);
 
         int regCount = 0;
-        if (m_regType0 != TYP_UNKNOWN)
+        for (unsigned i = 0; i < MAX_RET_REG_COUNT; ++i)
         {
-            ++regCount;
-
-            if (m_regType1 != TYP_UNKNOWN)
+            if (m_regType[i] == TYP_UNKNOWN)
             {
-                ++regCount;
+                break;
             }
+            // otherwise
+            regCount++;
         }
-        else
+
+#ifdef DEBUG
+        // Any remaining elements in m_regTypes[] should also be TYP_UNKNOWN
+        for (unsigned i = regCount+1; i < MAX_RET_REG_COUNT; ++i)
         {
-            // If regType0 is TYP_UNKNOWN then regType1 must also be TYP_UNKNOWN.
-            assert(m_regType1 == TYP_UNKNOWN);
+            assert(m_regType[i] == TYP_UNKNOWN);
         }
+#endif        
+
         return regCount;
     }
 
@@ -2463,9 +2476,19 @@ public:
     // Return Value:
     //    Returns true if the type is returned in multiple return registers.
     //    False otherwise.
+    // Note that we only have to examine the first two values to determine this
+    //
     bool IsMultiRegRetType() const
     {
-        return GetReturnRegCount() > 1;
+        if (MAX_RET_REG_COUNT < 2)
+        {
+            return false;
+        }
+        else
+        {
+            return ((m_regType[0] != TYP_UNKNOWN) &&
+                    (m_regType[1] != TYP_UNKNOWN));
+        }
     }
 
     //--------------------------------------------------------------------------
@@ -2477,21 +2500,14 @@ public:
     //
     // Return Value:
     //    var_type of the return register specified by its index.
-    //    Return TYP_UNKNOWN if index > number of return registers.
+    //    asserts if the index does not have a valid register return type.
+    
     var_types GetReturnRegType(unsigned index)
     {
-        assert(index < GetReturnRegCount());
+        var_types result = m_regType[index];
+        assert(result != TYP_UNKNOWN);
 
-        if (index == 0)
-        {
-            return m_regType0;
-        }
-        else if (index == 1)
-        {
-            return m_regType1;
-        }
-
-        return TYP_UNKNOWN;
+        return result;
     }
 
     // Get ith ABI return register 
@@ -2769,44 +2785,17 @@ struct GenTreeCall final : public GenTree
 
 #define     GTF_CALL_M_R2R_REL_INDIRECT        0x2000  // GT_CALL -- ready to run call is indirected through a relative address
 
-    bool IsUnmanaged()       { return (gtFlags & GTF_CALL_UNMANAGED) != 0; }
-    bool NeedsNullCheck()    { return (gtFlags & GTF_CALL_NULLCHECK) != 0; }
-    bool CallerPop()         { return (gtFlags & GTF_CALL_POP_ARGS) != 0;  }
-    bool IsVirtual()         { return (gtFlags & GTF_CALL_VIRT_KIND_MASK) != GTF_CALL_NONVIRT; }
-    bool IsVirtualStub()     { return (gtFlags & GTF_CALL_VIRT_KIND_MASK) == GTF_CALL_VIRT_STUB; }
-    bool IsVirtualVtable()   { return (gtFlags & GTF_CALL_VIRT_KIND_MASK) == GTF_CALL_VIRT_VTABLE; }
-    bool IsInlineCandidate() { return (gtFlags & GTF_CALL_INLINE_CANDIDATE) != 0; }
+    bool IsUnmanaged()       const { return (gtFlags & GTF_CALL_UNMANAGED) != 0; }
+    bool NeedsNullCheck()    const { return (gtFlags & GTF_CALL_NULLCHECK) != 0; }
+    bool CallerPop()         const { return (gtFlags & GTF_CALL_POP_ARGS) != 0;  }
+    bool IsVirtual()         const { return (gtFlags & GTF_CALL_VIRT_KIND_MASK) != GTF_CALL_NONVIRT; }
+    bool IsVirtualStub()     const { return (gtFlags & GTF_CALL_VIRT_KIND_MASK) == GTF_CALL_VIRT_STUB; }
+    bool IsVirtualVtable()   const { return (gtFlags & GTF_CALL_VIRT_KIND_MASK) == GTF_CALL_VIRT_VTABLE; }
+    bool IsInlineCandidate() const { return (gtFlags & GTF_CALL_INLINE_CANDIDATE) != 0; }
 
 #ifndef LEGACY_BACKEND
-    // Whether the method has non-standard args (i.e. passed in R10 or R11)
-    // See fgMorphArgs() to know the call types for which non-standard args are inserted.
-    bool HasNonStandardArgs()  { return IsUnmanaged() || (gtCallType == CT_INDIRECT && (IsVirtualStub() || gtCallCookie)); }
-
-    // Get the count of non-standard arg count 
-    int  GetNonStandardArgCount() 
-    {
-        if (IsUnmanaged())
-        {
-            // R11 = PInvoke cookie param
-            return 1;
-        }
-        else if (gtCallType == CT_INDIRECT)
-        {
-            if (IsVirtualStub())
-            {
-                // R11 = Virtual stub param
-                return 1;
-            }
-            else if (gtCallCookie != nullptr)
-            {
-                // R10 = PInvoke target param
-                // R11 = PInvoke cookie param
-                return 2;
-            }
-        }
-
-        return 0;
-    }
+    bool HasNonStandardAddedArgs(Compiler* compiler) const;
+    int GetNonStandardAddedArgCount(Compiler* compiler) const;
 #endif // !LEGACY_BACKEND
 
     // Returns true if this call uses a retBuf argument and its calling convention
@@ -2832,7 +2821,7 @@ struct GenTreeCall final : public GenTree
     //     will make HasRetBufArg() return true, but will also force the 
     //     use of register x8 to pass the RetBuf argument.
     //
-    bool TreatAsHasRetBufArg(Compiler* compiler);
+    bool TreatAsHasRetBufArg(Compiler* compiler) const;
 
     //-----------------------------------------------------------------------------------------
     // HasMultiRegRetVal: whether the call node returns its value in multiple return registers.
@@ -2847,63 +2836,64 @@ struct GenTreeCall final : public GenTree
     //     This is implemented only for x64 Unix and yet to be implemented for
     //     other multi-reg return target arch (arm64/arm32/x86).
     //
-    // TODO-ARM: Implement this routine for Arm64 and Arm32
     bool HasMultiRegRetVal() const 
-    { 
-#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-        return varTypeIsStruct(gtType) && !HasRetBufArg(); 
-#elif defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
+    {
+#if defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
         // LEGACY_BACKEND does not use multi reg returns for calls with long return types
         return varTypeIsLong(gtType);
+#elif FEATURE_MULTIREG_RET
+        return varTypeIsStruct(gtType) && !HasRetBufArg();
 #else
         return false;
 #endif
     }
 
     // Returns true if VM has flagged this method as CORINFO_FLG_PINVOKE.
-    bool IsPInvoke()                { return (gtCallMoreFlags & GTF_CALL_M_PINVOKE) != 0; }
+    bool IsPInvoke() const              { return (gtCallMoreFlags & GTF_CALL_M_PINVOKE) != 0; }
 
     // Note that the distinction of whether tail prefixed or an implicit tail call
     // is maintained on a call node till fgMorphCall() after which it will be
     // either a tail call (i.e. IsTailCall() is true) or a non-tail call.
-    bool IsTailPrefixedCall()       { return (gtCallMoreFlags & GTF_CALL_M_EXPLICIT_TAILCALL) != 0; }     
+    bool IsTailPrefixedCall() const     { return (gtCallMoreFlags & GTF_CALL_M_EXPLICIT_TAILCALL) != 0; }     
 
     // This method returning "true" implies that tail call flowgraph morhphing has 
     // performed final checks and committed to making a tail call.
-    bool IsTailCall()               { return (gtCallMoreFlags & GTF_CALL_M_TAILCALL) != 0; }
+    bool IsTailCall() const             { return (gtCallMoreFlags & GTF_CALL_M_TAILCALL) != 0; }
 
     // This method returning "true" implies that importer has performed tail call checks
     // and providing a hint that this can be converted to a tail call.
-    bool CanTailCall()              { return IsTailPrefixedCall() || IsImplicitTailCall(); }
+    bool CanTailCall() const            { return IsTailPrefixedCall() || IsImplicitTailCall(); }
 
 #ifndef LEGACY_BACKEND
-    bool IsTailCallViaHelper()      { return IsTailCall() && (gtCallMoreFlags & GTF_CALL_M_TAILCALL_VIA_HELPER); } 
+    bool IsTailCallViaHelper() const    { return IsTailCall() && (gtCallMoreFlags & GTF_CALL_M_TAILCALL_VIA_HELPER); } 
 #else // LEGACY_BACKEND
-    bool IsTailCallViaHelper()      { return true; }
+    bool IsTailCallViaHelper() const    { return true; }
 #endif // LEGACY_BACKEND
 
 #if FEATURE_FASTTAILCALL    
-    bool IsFastTailCall()           { return IsTailCall() && !(gtCallMoreFlags & GTF_CALL_M_TAILCALL_VIA_HELPER); }
+    bool IsFastTailCall() const         { return IsTailCall() && !(gtCallMoreFlags & GTF_CALL_M_TAILCALL_VIA_HELPER); }
 #else // !FEATURE_FASTTAILCALL
-    bool IsFastTailCall()           { return false; }    
+    bool IsFastTailCall() const         { return false; }    
 #endif // !FEATURE_FASTTAILCALL
 
 #if FEATURE_TAILCALL_OPT
     // Returns true if this is marked for opportunistic tail calling.
     // That is, can be tail called though not explicitly prefixed with "tail" prefix.
-    bool IsImplicitTailCall()       { return (gtCallMoreFlags & GTF_CALL_M_IMPLICIT_TAILCALL) != 0; }
-    bool IsTailCallConvertibleToLoop() { return (gtCallMoreFlags & GTF_CALL_M_TAILCALL_TO_LOOP) != 0; }
+    bool IsImplicitTailCall() const             { return (gtCallMoreFlags & GTF_CALL_M_IMPLICIT_TAILCALL) != 0; }
+    bool IsTailCallConvertibleToLoop() const    { return (gtCallMoreFlags & GTF_CALL_M_TAILCALL_TO_LOOP) != 0; }
 #else // !FEATURE_TAILCALL_OPT
-    bool IsImplicitTailCall()       { return false; }
-    bool IsTailCallConvertibleToLoop() { return false; }
+    bool IsImplicitTailCall() const             { return false; }
+    bool IsTailCallConvertibleToLoop() const    { return false; }
 #endif // !FEATURE_TAILCALL_OPT
 
-    bool IsSameThis()      { return (gtCallMoreFlags & GTF_CALL_M_NONVIRT_SAME_THIS) != 0; } 
-    bool IsDelegateInvoke(){ return (gtCallMoreFlags & GTF_CALL_M_DELEGATE_INV) != 0; } 
-    bool IsVirtualStubRelativeIndir() { return (gtCallMoreFlags & GTF_CALL_M_VIRTSTUB_REL_INDIRECT) != 0; } 
+    bool IsSameThis() const                 { return (gtCallMoreFlags & GTF_CALL_M_NONVIRT_SAME_THIS) != 0; } 
+    bool IsDelegateInvoke() const           { return (gtCallMoreFlags & GTF_CALL_M_DELEGATE_INV) != 0; } 
+    bool IsVirtualStubRelativeIndir() const { return (gtCallMoreFlags & GTF_CALL_M_VIRTSTUB_REL_INDIRECT) != 0; } 
+
 #ifdef FEATURE_READYTORUN_COMPILER
-    bool IsR2RRelativeIndir() { return (gtCallMoreFlags & GTF_CALL_M_R2R_REL_INDIRECT) != 0; }
-    void setEntryPoint(CORINFO_CONST_LOOKUP entryPoint) {
+    bool IsR2RRelativeIndir() const         { return (gtCallMoreFlags & GTF_CALL_M_R2R_REL_INDIRECT) != 0; }
+    void setEntryPoint(CORINFO_CONST_LOOKUP entryPoint)
+    {
         gtEntryPoint = entryPoint;
         if (gtEntryPoint.accessType == IAT_PVALUE)
         {
@@ -2911,7 +2901,8 @@ struct GenTreeCall final : public GenTree
         }
     }
 #endif // FEATURE_READYTORUN_COMPILER
-    bool IsVarargs()       { return (gtCallMoreFlags & GTF_CALL_M_VARARGS) != 0; }
+
+    bool IsVarargs() const                  { return (gtCallMoreFlags & GTF_CALL_M_VARARGS) != 0; }
 
     unsigned short  gtCallMoreFlags;        // in addition to gtFlags
     
@@ -2953,6 +2944,18 @@ struct GenTreeCall final : public GenTree
     // IL offset of the call wrt its parent method.
     IL_OFFSET gtRawILOffset;
 #endif // defined(DEBUG) || defined(INLINE_DATA)
+ 
+    bool IsHelperCall() const
+    {
+        return gtCallType == CT_HELPER;
+    }
+ 
+    bool IsHelperCall(CORINFO_METHOD_HANDLE callMethHnd) const
+    {
+        return IsHelperCall() && (callMethHnd == gtCallMethHnd);
+    }
+ 
+    bool IsHelperCall(Compiler* compiler, unsigned helper) const;
 
     GenTreeCall(var_types type) : 
         GenTree(GT_CALL, type) 
@@ -3284,8 +3287,14 @@ public:
                                 return gtOp1->gtOp.gtOp1;
                               }
 
+    // Return true iff the object being copied contains one or more GC pointers.
+    bool        HasGCPtr();
+
     // True if this BlkOpNode is a volatile memory operation.
     bool IsVolatile() const { return (gtFlags & GTF_BLK_VOLATILE) != 0; }
+
+    // True if this BlkOpNode is a volatile memory operation.
+    bool IsUnaligned() const { return (gtFlags & GTF_BLK_UNALIGNED) != 0; }
 
     // Instruction selection: during codegen time, what code sequence we will be using
     // to encode this operation.
@@ -3312,27 +3321,6 @@ protected:
     friend GenTree;
     GenTreeBlkOp() : GenTreeOp(){}
 #endif // DEBUGGABLE_GENTREE
-};
-
-// gtObj  -- 'object' (GT_OBJ). */
-
-struct GenTreeObj: public GenTreeUnOp
-{
-    // The address of the block.
-    GenTreePtr&     Addr()          { return gtOp1; }
-
-    CORINFO_CLASS_HANDLE gtClass;   // the class of the object
-
-    GenTreeObj(var_types type, GenTreePtr addr, CORINFO_CLASS_HANDLE cls) : 
-        GenTreeUnOp(GT_OBJ, type, addr),
-        gtClass(cls)
-        {
-            gtFlags |= GTF_GLOB_REF; // An Obj is always a global reference.
-        }
-
-#if DEBUGGABLE_GENTREE
-    GenTreeObj() : GenTreeUnOp() {}
-#endif
 };
 
 // Represents a CpObj MSIL Node.
@@ -3540,6 +3528,25 @@ protected:
     friend GenTree;
     // Used only for GenTree::GetVtableForOper()
     GenTreeIndir() : GenTreeOp() {}
+#endif
+};
+
+// gtObj  -- 'object' (GT_OBJ). */
+
+struct GenTreeObj: public GenTreeIndir
+{
+    CORINFO_CLASS_HANDLE gtClass;   // the class of the object
+
+    GenTreeObj(var_types type, GenTreePtr addr, CORINFO_CLASS_HANDLE cls) : 
+        GenTreeIndir(GT_OBJ, type, addr, nullptr),
+        gtClass(cls)
+        {
+            // By default, an OBJ is assumed to be a global reference.
+            gtFlags |= GTF_GLOB_REF;
+        }
+
+#if DEBUGGABLE_GENTREE
+    GenTreeObj() : GenTreeIndir() {}
 #endif
 };
 
@@ -4051,8 +4058,6 @@ struct GenTreeCopyOrReload : public GenTreeUnOp
     // Return Value:
     //    None.
     //
-    // TODO-ARM: Implement this routine for Arm64 and Arm32
-    // TODO-X86: Implement this routine for x86
     void SetRegNumByIdx(regNumber reg, unsigned idx)
     {
         assert(idx < MAX_RET_REG_COUNT);
@@ -4061,7 +4066,7 @@ struct GenTreeCopyOrReload : public GenTreeUnOp
         {
             gtRegNum = reg;
         }
-#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
+#if FEATURE_MULTIREG_RET
         else
         {
             gtOtherRegs[idx - 1] = reg;
@@ -4116,6 +4121,28 @@ struct GenTreeCopyOrReload : public GenTreeUnOp
 // Deferred inline functions of GenTree -- these need the subtypes above to
 // be defined already.
 //------------------------------------------------------------------------
+
+inline bool            GenTree::OperIsBlkOp() const
+{
+    return (gtOper == GT_INITBLK ||
+            gtOper == GT_COPYBLK ||
+            gtOper == GT_COPYOBJ);
+}
+
+inline bool            GenTree::OperIsDynBlkOp()
+{
+    return (OperIsBlkOp() && !gtGetOp2()->IsCnsIntOrI());
+}
+
+inline bool            GenTree::OperIsCopyBlkOp() const
+{
+    return (gtOper == GT_COPYOBJ || gtOper == GT_COPYBLK);
+}
+
+inline bool GenTree::OperIsInitBlkOp() const
+{
+    return (gtOper == GT_INITBLK);
+}
 
 //------------------------------------------------------------------------
 // IsFPZero: Checks whether this is a floating point constant with value 0.0
@@ -4452,6 +4479,42 @@ inline bool GenTree::IsHelperCall() { return OperGet() == GT_CALL && gtCall.gtCa
 inline var_types GenTree::CastFromType() { return this->gtCast.CastOp()->TypeGet(); }
 inline var_types& GenTree::CastToType()  { return this->gtCast.gtCastType; }
 
+//-----------------------------------------------------------------------------------
+// HasGCPtr: determine whether this block op involves GC pointers
+//
+// Arguments:
+//     None
+//
+// Return Value:
+//    Returns true iff the object being copied contains one or more GC pointers.
+//
+// Notes:
+//    Of the block ops only GT_COPYOBJ is allowed to have GC pointers.
+// 
+inline bool
+GenTreeBlkOp::HasGCPtr()
+{
+    if (gtFlags & GTF_BLK_HASGCPTR)
+    {
+        assert((gtOper == GT_COPYOBJ) && (AsCpObj()->gtGcPtrCount != 0));
+        return true;
+    }
+    return false;
+}
+
+inline bool GenTree::isContainedSpillTemp() const
+{
+#if !defined(LEGACY_BACKEND)
+    // If spilled and no reg at use, then it is treated as contained.
+    if (((gtFlags & GTF_SPILLED) != 0) &&
+        ((gtFlags & GTF_NOREG_AT_USE) != 0))
+    {
+        return true;
+    }
+#endif //!LEGACY_BACKEND
+
+    return false;
+}
 
 /*****************************************************************************/
 

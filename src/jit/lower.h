@@ -52,11 +52,9 @@ public:
 private:
     // Friends
     static Compiler::fgWalkResult LowerNodeHelper   (GenTreePtr* ppTree, Compiler::fgWalkData* data);
-    static Compiler::fgWalkResult DecompNodeHelper  (GenTreePtr* ppTree, Compiler::fgWalkData* data);
     static Compiler::fgWalkResult TreeInfoInitHelper(GenTreePtr* ppTree, Compiler::fgWalkData* data);
     
     // Member Functions
-    void DecomposeNode(GenTreePtr* tree, Compiler::fgWalkData* data);
     void LowerNode(GenTreePtr* tree, Compiler::fgWalkData* data);
     GenTreeStmt* LowerMorphAndSeqTree(GenTree *tree);
     void CheckVSQuirkStackPaddingNeeded(GenTreeCall* call);
@@ -143,20 +141,83 @@ private:
 
     void TreeNodeInfoInit(GenTree* stmt);
     void TreeNodeInfoInit(GenTreePtr* tree, GenTree* parent);
-#ifdef _TARGET_ARM_
-    void TreeNodeInfoInitCall(GenTreePtr tree, TreeNodeInfo &info, int &srcCount, int &dstCount);
-#endif // _TARGET_ARM_
-    void TreeNodeInfoInitStructArg(GenTreePtr structArg);
+#if defined(_TARGET_XARCH_)
+    void TreeNodeInfoInitSimple(GenTree* tree);
+
+    //----------------------------------------------------------------------
+    // SetRegOptional - sets a bit to indicate to LSRA that register
+    // for a given tree node is optional for codegen purpose.  If no
+    // register is allocated to such a tree node, its parent node treats
+    // it as a contained memory operand during codegen.
+    //
+    // Arguments:
+    //    tree    -   GenTree node
+    //
+    // Returns
+    //    None
+    void SetRegOptional(GenTree* tree)
+    {
+        tree->gtLsraInfo.regOptional = true;
+    }
+    
+    GenTree* PreferredRegOptionalOperand(GenTree* tree);
+
+    // ------------------------------------------------------------------
+    // SetRegOptionalBinOp - Indicates which of the operands of a bin-op
+    // register requirement is optional. Xarch instruction set allows
+    // either of op1 or op2 of binary operation (e.g. add, mul etc) to be
+    // a memory operand.  This routine provides info to register allocator
+    // which of its operands optionally require a register.  Lsra might not
+    // allocate a register to RefTypeUse positions of such operands if it
+    // is beneficial. In such a case codegen will treat them as memory
+    // operands.
+    //
+    // Arguments:
+    //     tree  -  Gentree of a bininary operation.
+    //
+    // Returns 
+    //     None.
+    // 
+    // Note: On xarch at most only one of the operands will be marked as
+    // reg optional, even when both operands could be considered register
+    // optional.
+    void SetRegOptionalForBinOp(GenTree* tree)
+    {
+        assert(GenTree::OperIsBinary(tree->OperGet()));
+
+        GenTree* op1 = tree->gtGetOp1();
+        GenTree* op2 = tree->gtGetOp2();
+
+        if (tree->OperIsCommutative() &&
+            tree->TypeGet() == op1->TypeGet())
+        {
+            GenTree* preferredOp = PreferredRegOptionalOperand(tree);
+            SetRegOptional(preferredOp);
+        }
+        else if (tree->TypeGet() == op2->TypeGet())
+        {
+            SetRegOptional(op2);
+        }
+    }
+#endif // defined(_TARGET_XARCH_)
+    void TreeNodeInfoInitReturn(GenTree* tree);
+    void TreeNodeInfoInitShiftRotate(GenTree* tree);
+    void TreeNodeInfoInitCall(GenTreeCall* call);
     void TreeNodeInfoInitBlockStore(GenTreeBlkOp* blkNode);
+    void TreeNodeInfoInitLogicalOp(GenTree* tree);
+    void TreeNodeInfoInitModDiv(GenTree* tree);
+    void TreeNodeInfoInitIntrinsic(GenTree* tree);
 #ifdef FEATURE_SIMD
-    void TreeNodeInfoInitSIMD(GenTree* tree, LinearScan* lsra);
+    void TreeNodeInfoInitSIMD(GenTree* tree);
 #endif // FEATURE_SIMD
+    void TreeNodeInfoInitCast(GenTree* tree);
 #ifdef _TARGET_ARM64_
     void TreeNodeInfoInitPutArgStk(GenTree* argNode, fgArgTabEntryPtr info);
 #endif // _TARGET_ARM64_
-#if defined(_TARGET_XARCH_)
-    void TreeNodeInfoInitSimple(GenTree* tree, TreeNodeInfo* info, unsigned kind);
-#endif // defined(_TARGET_XARCH_)
+#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
+    void TreeNodeInfoInitPutArgStk(GenTree* tree);
+#endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
+    void TreeNodeInfoInitLclHeap(GenTree* tree);
 
     void SpliceInUnary(GenTreePtr parent, GenTreePtr* ppChild, GenTreePtr newNode);
     void DumpNodeInfoMap();
@@ -165,6 +226,8 @@ private:
     void LowerInd(GenTreePtr* ppTree);
     void LowerAddrMode(GenTreePtr* ppTree, GenTree* before, Compiler::fgWalkData* data, bool isIndir);
     void LowerAdd(GenTreePtr* ppTree, Compiler::fgWalkData* data);
+    void LowerUnsignedDivOrMod(GenTree* tree);
+    void LowerSignedDivOrMod(GenTreePtr* ppTree, Compiler::fgWalkData* data);
 
     // Remove the nodes that are no longer used after an addressing mode is constructed under a GT_IND
     void LowerIndCleanupHelper(GenTreeAddrMode* addrMode, GenTreePtr tree);
@@ -194,7 +257,7 @@ private:
     static bool NodesAreEquivalentLeaves       (GenTreePtr candidate, GenTreePtr storeInd);
 
     GenTreePtr  CreateLocalTempAsg      (GenTreePtr rhs, unsigned refCount, GenTreePtr *ppLclVar = nullptr);
-
+    GenTreeStmt* CreateTemporary        (GenTree** ppTree);
     bool AreSourcesPossiblyModified     (GenTree* use, GenTree* src1, GenTree *src2);
     void ReplaceNode                    (GenTree** ppTreeLocation,
                                          GenTree* replacementNode,
@@ -202,7 +265,6 @@ private:
                                          BasicBlock* block);
 
     void UnlinkNode                     (GenTree** ppParentLink, GenTree* stmt, BasicBlock* block);
-    void SimpleLinkNodeAfter            (GenTree* prevTree, GenTree* newTree);
 
     // return true if 'childNode' is an immediate that can be contained 
     //  by the 'parentNode' (i.e. folded into an instruction)

@@ -384,11 +384,14 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
 #ifdef LEGACY_BACKEND
   #define FEATURE_MULTIREG_ARGS_OR_RET  0  // Support for passing and/or returning single values in more than one register
   #define FEATURE_MULTIREG_ARGS         0  // Support for passing a single argument in more than one register  
-  #define FEATURE_MULTIREG_RET          0  // Support for returning a single value in more than one register  
+  #define FEATURE_MULTIREG_RET          0  // Support for returning a single value in more than one register
+  #define MAX_PASS_MULTIREG_BYTES       0  // No multireg arguments 
+  #define MAX_RET_MULTIREG_BYTES        0  // No multireg return values 
 #else
   #define FEATURE_MULTIREG_ARGS_OR_RET  1  // Support for passing and/or returning single values in more than one register
   #define FEATURE_MULTIREG_ARGS         0  // Support for passing a single argument in more than one register  
-  #define FEATURE_MULTIREG_RET          1  // Support for returning a single value in more than one register  
+  #define FEATURE_MULTIREG_RET          1  // Support for returning a single value in more than one register
+  #define MAX_PASS_MULTIREG_BYTES       0  // No multireg arguments (note this seems wrong as MAX_ARG_REG_COUNT is 2)
   #define MAX_RET_MULTIREG_BYTES        8  // Maximum size of a struct that could be returned in more than one register
 #endif
 
@@ -482,6 +485,7 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
   #define CODE_ALIGN               1       // code alignment requirement
   #define STACK_ALIGN              4       // stack alignment requirement
   #define STACK_ALIGN_SHIFT        2       // Shift-right amount to convert stack size in bytes to size in DWORD_PTRs
+  #define STACK_ALIGN_SHIFT_ALL    2       // Shift-right amount to convert stack size in bytes to size in STACK_ALIGN units
 
   #define RBM_INT_CALLEE_SAVED    (RBM_EBX|RBM_ESI|RBM_EDI)
   #define RBM_INT_CALLEE_TRASH    (RBM_EAX|RBM_ECX|RBM_EDX)
@@ -584,11 +588,11 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
   #define PREDICT_REG_VIRTUAL_STUB_PARAM  PREDICT_REG_EAX
 
   // Registers used by PInvoke frame setup
-  #define REG_PINVOKE_FRAME        REG_EDI
+  #define REG_PINVOKE_FRAME        REG_EDI      // EDI is p/invoke "Frame" pointer argument to CORINFO_HELP_INIT_PINVOKE_FRAME helper
   #define RBM_PINVOKE_FRAME        RBM_EDI
-  #define REG_PINVOKE_TCB          REG_ESI
+  #define REG_PINVOKE_TCB          REG_ESI      // ESI is set to Thread Control Block (TCB) on return from CORINFO_HELP_INIT_PINVOKE_FRAME helper
   #define RBM_PINVOKE_TCB          RBM_ESI
-  #define REG_PINVOKE_SCRATCH      REG_EAX
+  #define REG_PINVOKE_SCRATCH      REG_EAX      // EAX is trashed by CORINFO_HELP_INIT_PINVOKE_FRAME helper
   #define RBM_PINVOKE_SCRATCH      RBM_EAX
 
 #ifdef LEGACY_BACKEND
@@ -623,6 +627,10 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
 
   // The registers trashed by the CORINFO_HELP_STOP_FOR_GC helper
   #define RBM_STOP_FOR_GC_TRASH    RBM_CALLEE_TRASH
+
+  // The registers trashed by the CORINFO_HELP_INIT_PINVOKE_FRAME helper. On x86, this helper has a custom calling
+  // convention that takes EDI as argument (but doesn't trash it), trashes EAX, and returns ESI.
+  #define RBM_INIT_PINVOKE_FRAME_TRASH  (RBM_PINVOKE_SCRATCH | RBM_PINVOKE_TCB)
 
   #define REG_FPBASE               REG_EBP
   #define RBM_FPBASE               RBM_EBP
@@ -724,7 +732,9 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
 #else // !UNIX_AMD64_ABI
   #define FEATURE_MULTIREG_ARGS_OR_RET  0  // Support for passing and/or returning single values in more than one register
   #define FEATURE_MULTIREG_ARGS         0  // Support for passing a single argument in more than one register  
-  #define FEATURE_MULTIREG_RET          0  // Support for returning a single value in more than one register  
+  #define FEATURE_MULTIREG_RET          0  // Support for returning a single value in more than one register
+  #define MAX_PASS_MULTIREG_BYTES       0  // No multireg arguments 
+  #define MAX_RET_MULTIREG_BYTES        0  // No multireg return values 
   #define MAX_ARG_REG_COUNT             1  // Maximum registers used to pass a single argument (no arguments are passed using multiple registers)
   #define MAX_RET_REG_COUNT             1  // Maximum registers used to return a value.
 #endif // !UNIX_AMD64_ABI
@@ -771,6 +781,7 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
   #define CODE_ALIGN               1       // code alignment requirement
   #define STACK_ALIGN              16      // stack alignment requirement
   #define STACK_ALIGN_SHIFT        3       // Shift-right amount to convert stack size in bytes to size in pointer sized words
+  #define STACK_ALIGN_SHIFT_ALL    4       // Shift-right amount to convert stack size in bytes to size in STACK_ALIGN units
 
 #if ETW_EBP_FRAMED
   #define RBM_ETW_FRAMED_EBP        RBM_NONE
@@ -1108,6 +1119,9 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
   #define RBM_STOP_FOR_GC_TRASH     (RBM_CALLEE_TRASH & ~(RBM_FLOATRET | RBM_INTRET))
 #endif
 
+  // The registers trashed by the CORINFO_HELP_INIT_PINVOKE_FRAME helper.
+  #define RBM_INIT_PINVOKE_FRAME_TRASH  RBM_CALLEE_TRASH
+
   // What sort of reloc do we use for [disp32] address mode
   #define IMAGE_REL_BASED_DISP32   IMAGE_REL_BASED_REL32
 
@@ -1153,7 +1167,7 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
   #define FEATURE_SET_FLAGS        1       // Set to true to force the JIT to mark the trees with GTF_SET_FLAGS when the flags need to be set
   #define FEATURE_MULTIREG_ARGS_OR_RET  1  // Support for passing and/or returning single values in more than one register (including HFA support)
   #define FEATURE_MULTIREG_ARGS         1  // Support for passing a single argument in more than one register (including passing HFAs)
-  #define FEATURE_MULTIREG_RET          1  // Support for returning a single value in more than one register (including HFA returns)
+  #define FEATURE_MULTIREG_RET          0  // Support for returning a single value in more than one register (including HFA returns)
   #define FEATURE_STRUCT_CLASSIFIER     0  // Uses a classifier function to determine is structs are passed/returned in more than one register
   #define MAX_PASS_MULTIREG_BYTES      32  // Maximum size of a struct that could be passed in more than one register (Max is an HFA of 4 doubles)
   #define MAX_RET_MULTIREG_BYTES       32  // Maximum size of a struct that could be returned in more than one register (Max is an HFA of 4 doubles)
@@ -1389,6 +1403,9 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
   // See vm\arm\amshelpers.asm for more details.
   #define RBM_STOP_FOR_GC_TRASH     (RBM_CALLEE_TRASH & ~(RBM_FLOATRET | RBM_INTRET))
 
+  // The registers trashed by the CORINFO_HELP_INIT_PINVOKE_FRAME helper.
+  #define RBM_INIT_PINVOKE_FRAME_TRASH  RBM_CALLEE_TRASH
+
   #define REG_FPBASE               REG_R11
   #define RBM_FPBASE               RBM_R11
   #define STR_FPBASE               "r11"
@@ -1470,12 +1487,12 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
   #define FEATURE_SET_FLAGS        1       // Set to true to force the JIT to mark the trees with GTF_SET_FLAGS when the flags need to be set
   #define FEATURE_MULTIREG_ARGS_OR_RET  1  // Support for passing and/or returning single values in more than one register  
   #define FEATURE_MULTIREG_ARGS         1  // Support for passing a single argument in more than one register  
-  #define FEATURE_MULTIREG_RET          0  // Support for returning a single value in more than one register  
+  #define FEATURE_MULTIREG_RET          1  // Support for returning a single value in more than one register  
   #define FEATURE_STRUCT_CLASSIFIER     0  // Uses a classifier function to determine is structs are passed/returned in more than one register
   #define MAX_PASS_MULTIREG_BYTES      32  // Maximum size of a struct that could be passed in more than one register (max is 4 doubles using an HFA)
-  #define MAX_RET_MULTIREG_BYTES        0  // Maximum size of a struct that could be returned in more than one register (Max is an HFA of 4 doubles)
+  #define MAX_RET_MULTIREG_BYTES       32  // Maximum size of a struct that could be returned in more than one register (Max is an HFA of 4 doubles)
   #define MAX_ARG_REG_COUNT             4  // Maximum registers used to pass a single argument in multiple registers. (max is 4 floats or doubles using an HFA)
-  #define MAX_RET_REG_COUNT             1  // Maximum registers used to return a value.
+  #define MAX_RET_REG_COUNT             4  // Maximum registers used to return a value.
 
 #ifdef FEATURE_USE_ASM_GC_WRITE_BARRIERS
   #define NOGC_WRITE_BARRIERS      1       // We have specialized WriteBarrier JIT Helpers that DO-NOT trash the RBM_CALLEE_TRASH registers
@@ -1653,6 +1670,9 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
   #define RBM_INTRET               RBM_R0
   #define REG_LNGRET               REG_R0
   #define RBM_LNGRET               RBM_R0
+  // second return register for 16-byte structs
+  #define REG_INTRET_1             REG_R1 
+  #define RBM_INTRET_1             RBM_R1
 
   #define REG_FLOATRET             REG_V0
   #define RBM_FLOATRET             RBM_V0
@@ -1660,6 +1680,9 @@ typedef unsigned short          regPairNoSmall; // arm: need 12 bits
 
   // The registers trashed by the CORINFO_HELP_STOP_FOR_GC helper
   #define RBM_STOP_FOR_GC_TRASH    RBM_CALLEE_TRASH
+
+  // The registers trashed by the CORINFO_HELP_INIT_PINVOKE_FRAME helper.
+  #define RBM_INIT_PINVOKE_FRAME_TRASH  RBM_CALLEE_TRASH
 
   #define REG_FPBASE               REG_FP
   #define RBM_FPBASE               RBM_FP
@@ -1810,6 +1833,7 @@ class Target
 {
 public:
     static const char *             g_tgtCPUName;
+    static const char *             g_tgtPlatformName;
 
     enum ArgOrder { ARG_ORDER_R2L, ARG_ORDER_L2R };
     static const enum ArgOrder      g_tgtArgOrder;
@@ -1897,8 +1921,7 @@ inline bool         genIsValidDoubleReg(regNumber reg)
 //
 inline bool         hasFixedRetBuffReg()
 {
-    // Disable this until the VM changes are also enabled
-#if 0 //def _TARGET_ARM64_
+#ifdef _TARGET_ARM64_
     return true;
 #else
     return false;
@@ -1920,6 +1943,20 @@ inline regNumber    theFixedRetBuffReg()
 }
 
 //-------------------------------------------------------------------------------------------
+// theFixedRetBuffMask: 
+//     Returns the regNumber to use for the fixed return buffer 
+// 
+inline regMaskTP    theFixedRetBuffMask()
+{
+    assert(hasFixedRetBuffReg());   // This predicate should be checked before calling this method
+#ifdef _TARGET_ARM64_
+    return RBM_ARG_RET_BUFF;
+#else
+    return 0;
+#endif
+}
+
+//-------------------------------------------------------------------------------------------
 // theFixedRetBuffArgNum: 
 //     Returns the argNum to use for the fixed return buffer 
 // 
@@ -1934,17 +1971,30 @@ inline unsigned     theFixedRetBuffArgNum()
 }
 
 //-------------------------------------------------------------------------------------------
+// fullIntArgRegMask: 
+//     Returns the full mask of all possible integer registers
+//     Note this includes the fixed return buffer register on Arm64 
+//
+inline regMaskTP       fullIntArgRegMask()
+{    
+    if (hasFixedRetBuffReg())
+    {
+        return RBM_ARG_REGS | theFixedRetBuffMask();
+    }
+    else
+    {
+        return RBM_ARG_REGS;
+    }    
+}
+
+//-------------------------------------------------------------------------------------------
 // isValidIntArgReg: 
 //     Returns true if the register is a valid integer argument register 
 //     Note this method also returns true on Arm64 when 'reg' is the RetBuff register 
 //
 inline bool         isValidIntArgReg(regNumber reg)
 {
-    if (hasFixedRetBuffReg() && (reg == theFixedRetBuffReg()))
-    {
-        return true;
-    }
-    return (genRegMask(reg) & RBM_ARG_REGS) != 0;
+    return (genRegMask(reg) & fullIntArgRegMask()) != 0;
 }
 
 //-------------------------------------------------------------------------------------------

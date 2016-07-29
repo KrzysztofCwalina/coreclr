@@ -21,7 +21,7 @@ XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 #endif
 
-#include "gcinfo.h"
+#include "gcinfotypes.h"
 
 #ifdef JIT32_GCENCODER
 
@@ -1785,7 +1785,7 @@ size_t              GCInfo::gcMakeRegPtrTable(BYTE*          dest,
                             /* If this non-enregistered pointer arg is never
                              * used, we don't need to report it
                              */
-                            assert(varDsc->lvRefCnt == 0);
+                            assert(varDsc->lvRefCnt == 0);  // This assert is currently a known issue for X86-RyuJit
                             continue;
                         }
                         else  if (varDsc->lvIsRegArg && varDsc->lvTracked)
@@ -3236,7 +3236,7 @@ unsigned            GCInfo::gcInfoBlockHdrDump(const BYTE*  table,
                                                InfoHdr*     header,
                                                unsigned*    methodSize)
 {
-    GCDump gcDump;
+    GCDump gcDump(GCINFO_VERSION);
 
     gcDump.gcPrintf = gcDump_logf;             // use my printf (which logs to VM)
     printf("Method info block:\n");
@@ -3252,7 +3252,7 @@ unsigned            GCInfo::gcDumpPtrTable(const BYTE*    table,
 {
     printf("Pointer table:\n");
 
-    GCDump gcDump;
+    GCDump gcDump(GCINFO_VERSION);
     gcDump.gcPrintf = gcDump_logf;             // use my printf (which logs to VM)
 
     return gcDump.DumpGCTable(table, header, methodSize, verifyGCTables);
@@ -3268,7 +3268,7 @@ void                GCInfo::gcFindPtrsInFrame(const void* infoBlock,
                                               const void* codeBlock,
                                               unsigned    offs)
 {
-    GCDump gcDump;
+    GCDump gcDump(GCINFO_VERSION);
     gcDump.gcPrintf = gcDump_logf;             // use my printf (which logs to VM)
 
     gcDump.DumpPtrsInFrame((const BYTE*)infoBlock, (const BYTE*)codeBlock, offs, verifyGCTables);

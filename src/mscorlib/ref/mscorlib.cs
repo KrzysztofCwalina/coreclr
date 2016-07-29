@@ -171,13 +171,14 @@ namespace System
         public ArithmeticException(string message, System.Exception innerException) { }
     }
     [System.Runtime.InteropServices.ComVisibleAttribute(true)]
-    public abstract partial class Array : System.Collections.ICollection, System.Collections.IEnumerable, System.Collections.IList, System.Collections.IStructuralComparable, System.Collections.IStructuralEquatable
+    public abstract partial class Array : System.Collections.ICollection, System.Collections.IEnumerable, System.Collections.IList, System.Collections.IStructuralComparable, System.Collections.IStructuralEquatable, System.ICloneable
     {
         internal Array() { }
         public bool IsFixedSize { get { return default(bool); } }
         public bool IsReadOnly { get { return default(bool); } }
         public bool IsSynchronized { get { return default(bool); } }
         public int Length { [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]get { return default(int); } }
+        public long LongLength { [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]get { return default(long); } }
         public int Rank { [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]get { return default(int); } }
         public object SyncRoot { get { return default(object); } }
         int System.Collections.ICollection.Count { get { return default(int); } }
@@ -207,20 +208,28 @@ namespace System
         
         [System.Security.SecuritySafeCriticalAttribute]
         public static void ConstrainedCopy(System.Array sourceArray, int sourceIndex, System.Array destinationArray, int destinationIndex, int length) { }
-        
+        public static TOutput[] ConvertAll<TInput, TOutput>(TInput[] array, System.Converter<TInput, TOutput> converter) { return default(TOutput[]); }
+
         [System.Security.SecuritySafeCriticalAttribute]
         public static void Copy(System.Array sourceArray, System.Array destinationArray, int length) { }
-        
+        public static void Copy(System.Array sourceArray, System.Array destinationArray, long length) { }
         [System.Security.SecuritySafeCriticalAttribute]
         public static void Copy(System.Array sourceArray, int sourceIndex, System.Array destinationArray, int destinationIndex, int length) { }
+        public static void Copy(System.Array sourceArray, long sourceIndex, System.Array destinationArray, long destinationIndex, long length) { }
         public void CopyTo(System.Array array, int index) { }
+        public void CopyTo(System.Array array, long index) { }
         [System.Security.SecuritySafeCriticalAttribute]
         public static System.Array CreateInstance(System.Type elementType, int length) { return default(System.Array); }
+        [System.Security.SecuritySafeCriticalAttribute]
+        public static System.Array CreateInstance(System.Type elementType, int length1, int length2) { return default(System.Array); }
+        [System.Security.SecuritySafeCriticalAttribute]
+        public static System.Array CreateInstance(System.Type elementType, int length1, int length2, int length3) { return default(System.Array); }
         [System.Security.SecuritySafeCriticalAttribute]
         public static System.Array CreateInstance(System.Type elementType, params int[] lengths) { return default(System.Array); }
         [System.Security.SecuritySafeCriticalAttribute]
         public static System.Array CreateInstance(System.Type elementType, int[] lengths, int[] lowerBounds) { return default(System.Array); }
-        
+        public static System.Array CreateInstance(System.Type elementType, params long[] lengths) { return default(System.Array); }
+
         public static T[] Empty<T>() { return default(T[]); }
         public static bool Exists<T>(T[] array, System.Predicate<T> match) { return default(bool); }
         public static T Find<T>(T[] array, System.Predicate<T> match) { return default(T); }
@@ -236,6 +245,7 @@ namespace System
         public System.Collections.IEnumerator GetEnumerator() { return default(System.Collections.IEnumerator); }
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)][System.Security.SecuritySafeCriticalAttribute]
         public int GetLength(int dimension) { return default(int); }
+        public long GetLongLength(int dimension) { return default(long); }
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.InternalCall)]
         [System.Security.SecuritySafeCriticalAttribute]
         public int GetLowerBound(int dimension) { return default(int); }
@@ -245,8 +255,16 @@ namespace System
         [System.Security.SecuritySafeCriticalAttribute]
         public object GetValue(int index) { return default(object); }
         [System.Security.SecuritySafeCriticalAttribute]
+        public object GetValue(int index1, int index2) { return default(object); }
+        [System.Security.SecuritySafeCriticalAttribute]
+        public object GetValue(int index1, int index2, int index3) { return default(object); }
+        [System.Security.SecuritySafeCriticalAttribute]
         public object GetValue(params int[] indices) { return default(object); }
-        
+        public object GetValue(long index) { return default(object); }
+        public object GetValue(long index1, long index2) { return default(object); }
+        public object GetValue(long index1, long index2, long index3) { return default(object); }
+        public object GetValue(params long[] indices) { return default(object); }
+
         public static int IndexOf(System.Array array, object value) { return default(int); }
         
         public static int IndexOf(System.Array array, object value, int startIndex) { return default(int); }
@@ -278,8 +296,16 @@ namespace System
         [System.Security.SecuritySafeCriticalAttribute]
         public void SetValue(object value, int index) { }
         [System.Security.SecuritySafeCriticalAttribute]
+        public void SetValue(object value, int index1, int index2) { }
+        [System.Security.SecuritySafeCriticalAttribute]
+        public void SetValue(object value, int index1, int index2, int index3) { }
+        [System.Security.SecuritySafeCriticalAttribute]
         public void SetValue(object value, params int[] indices) { }
-        
+        public void SetValue(object value, long index) { }
+        public void SetValue(object value, long index1, long index2) { }
+        public void SetValue(object value, long index1, long index2, long index3) { }
+        public void SetValue(object value, params long[] indices) { }
+
         public static void Sort(System.Array array) { }
         
         public static void Sort(System.Array keys, System.Array items) { }
@@ -2457,6 +2483,13 @@ namespace System
         public NotFiniteNumberException(string message) { }
         public NotFiniteNumberException(string message, System.Exception innerException) { }
     }
+    [AttributeUsage(AttributeTargets.Field, Inherited = false)]
+    public sealed class NonSerializedAttribute : Attribute
+    {
+        public NonSerializedAttribute()
+        {
+        }
+    }
     [System.Runtime.InteropServices.ComVisibleAttribute(true)]
     public partial class NotImplementedException : System.SystemException
     {
@@ -2738,6 +2771,13 @@ namespace System
         public static bool TryParse(string s, System.Globalization.NumberStyles style, System.IFormatProvider provider, out sbyte result) { result = default(sbyte); return default(bool); }
         [System.CLSCompliantAttribute(false)]
         public static bool TryParse(string s, out sbyte result) { result = default(sbyte); return default(bool); }
+    }
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Enum | AttributeTargets.Delegate, Inherited = false)]
+    public sealed class SerializableAttribute : Attribute
+    {
+        public SerializableAttribute()
+        {
+        }
     }
     [System.Runtime.InteropServices.ComVisibleAttribute(true)]
     [System.Runtime.InteropServices.StructLayoutAttribute(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -4213,6 +4253,7 @@ namespace System.Collections.Generic
         public int BinarySearch(int index, int count, T item, System.Collections.Generic.IComparer<T> comparer) { return default(int); }
         public void Clear() { }
         public bool Contains(T item) { return default(bool); }
+        public List<TOutput> ConvertAll<TOutput>(System.Converter<T,TOutput> converter) { throw null; }
         public void CopyTo(T[] array) { }
         public void CopyTo(T[] array, int arrayIndex) { }
         public void CopyTo(int index, T[] array, int arrayIndex, int count) { }
@@ -4476,6 +4517,9 @@ namespace System.Diagnostics
             IgnoreSymbolStoreSequencePoints = 2,
             None = 0,
         }
+        public bool IsJITTrackingEnabled { get { return default(bool); } }
+        public bool IsJITOptimizerDisabled { get { return default(bool); } }
+        public DebuggingModes DebuggingFlags { get { return default(DebuggingModes); } }
     }
     [System.Runtime.InteropServices.ComVisibleAttribute(true)]
     public sealed partial class Debugger
@@ -11266,6 +11310,47 @@ namespace System.Runtime.Serialization
         [System.Security.SecurityCriticalAttribute]
         public static object GetUninitializedObject(System.Type type) { return default(object); }
     }
+    [System.Runtime.InteropServices.ComVisibleAttribute(true)]
+    public interface IDeserializationCallback
+    {
+        void OnDeserialization(object sender);
+    }
+    [System.Runtime.InteropServices.ComVisibleAttribute(true)]
+    [System.CLSCompliant(false)]
+    public interface IFormatterConverter
+    {
+        object Convert(object value, Type type);
+        object Convert(object value, TypeCode typeCode);
+        bool ToBoolean(object value);
+        char ToChar(object value);
+        [CLSCompliant(false)]
+        sbyte ToSByte(object value);
+        byte ToByte(object value);
+        short ToInt16(object value);
+        [CLSCompliant(false)]
+        ushort ToUInt16(object value);
+        int ToInt32(object value);
+        [CLSCompliant(false)]
+        uint ToUInt32(object value);
+        long ToInt64(object value);
+        [CLSCompliant(false)]
+        ulong ToUInt64(object value);
+        float ToSingle(object value);
+        double ToDouble(object value);
+        Decimal ToDecimal(object value);
+        DateTime ToDateTime(object value);
+        String ToString(object value);
+    }
+    [System.Runtime.InteropServices.ComVisible(true)]
+    public interface IObjectReference
+    {
+        object GetRealObject(StreamingContext context);
+    }
+    [System.Runtime.InteropServices.ComVisibleAttribute(true)]
+    public interface ISerializable
+    {
+        void GetObjectData(SerializationInfo info, StreamingContext context);
+    }
     [System.AttributeUsageAttribute((System.AttributeTargets)(64), Inherited=false)]
     [System.Runtime.InteropServices.ComVisibleAttribute(true)]
     public sealed partial class OnDeserializedAttribute : System.Attribute
@@ -11290,12 +11375,94 @@ namespace System.Runtime.Serialization
     {
         public OnSerializingAttribute() { }
     }
+    [System.AttributeUsageAttribute(System.AttributeTargets.Field, Inherited = false)]
+    [System.Runtime.InteropServices.ComVisibleAttribute(true)]
+    public sealed partial class OptionalFieldAttribute : System.Attribute
+    {
+        public OptionalFieldAttribute() { }
+        public int VersionAdded { get { return default(int); } set { } }
+    }
+    [System.Runtime.InteropServices.StructLayoutAttribute(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    [System.Runtime.InteropServices.ComVisibleAttribute(true)]
+    public struct SerializationEntry
+    {
+        public string Name { get { throw null; } }
+        public Type ObjectType { get { throw null; } }
+        public object Value { get { throw null; } }
+    }
     [System.Runtime.InteropServices.ComVisibleAttribute(true)]
     public partial class SerializationException : System.SystemException
     {
         public SerializationException() { }
         public SerializationException(string message) { }
         public SerializationException(string message, System.Exception innerException) { }
+    }
+    [System.Runtime.InteropServices.ComVisibleAttribute(true)]
+    public sealed class SerializationInfo
+    {
+        [CLSCompliant(false)]
+        public SerializationInfo(Type type, IFormatterConverter converter) { }
+        public string AssemblyName { get { throw null; } set { } }
+        public string FullTypeName { get { throw null; } set { } }
+        public bool IsFullTypeNameSetExplicit { get { throw null; } }
+        public bool IsAssemblyNameSetExplicit { get { throw null; } }
+        public int MemberCount { get { throw null; } }
+        public Type ObjectType { get { throw null; } }
+        public void AddValue(string name, bool value) { }
+        public void AddValue(string name, byte value) { }
+        public void AddValue(string name, char value) { }
+        public void AddValue(string name, DateTime value) { }
+        public void AddValue(string name, decimal value) { }
+        public void AddValue(string name, double value) { }
+        public void AddValue(string name, short value) { }
+        public void AddValue(string name, int value) { }
+        public void AddValue(string name, long value) { }
+        public void AddValue(string name, object value) { }
+        public void AddValue(string name, object value, Type type) { }
+        [CLSCompliant(false)]
+        public void AddValue(string name, sbyte value) { }
+        public void AddValue(string name, float value) { }
+        [CLSCompliant(false)]
+        public void AddValue(string name, ushort value) { }
+        [CLSCompliant(false)]
+        public void AddValue(string name, uint value) { }
+        [CLSCompliant(false)]
+        public void AddValue(string name, ulong value) { }
+        public bool GetBoolean(string name) { throw null; }
+        public byte GetByte(string name) { throw null; }
+        public char GetChar(string name) { throw null; }
+        public DateTime GetDateTime(string name) { throw null; }
+        public decimal GetDecimal(string name) { throw null; }
+        public double GetDouble(string name) { throw null; }
+        public SerializationInfoEnumerator GetEnumerator() { throw null; }
+        public short GetInt16(string name) { throw null; }
+        public int GetInt32(string name) { throw null; }
+        public long GetInt64(string name) { throw null; }
+        [CLSCompliant(false)]
+        public sbyte GetSByte(string name) { throw null; }
+        public float GetSingle(string name) { throw null; }
+        public string GetString(string name) { throw null; }
+        [CLSCompliant(false)]
+        public ushort GetUInt16(string name) { throw null; }
+        [CLSCompliant(false)]
+        public uint GetUInt32(string name) { throw null; }
+        [CLSCompliant(false)]
+        public ulong GetUInt64(string name) { throw null; }
+        public object GetValue(string name, Type type) { throw null; }
+        public void SetType(Type type) { }
+        public void UpdateValue(string name, object value, Type type) { }
+    }
+    [System.Runtime.InteropServices.ComVisibleAttribute(true)]
+    public sealed class SerializationInfoEnumerator : System.Collections.IEnumerator
+    {
+        private SerializationInfoEnumerator() { }
+        public SerializationEntry Current { get { throw null; } }
+        public string Name { get { throw null; } }
+        public Type ObjectType { get { throw null; } }
+        object System.Collections.IEnumerator.Current { get { throw null; } }
+        public object Value { get { throw null; } }
+        public bool MoveNext() { throw null; }
+        public void Reset() { throw null; }
     }
     [System.Runtime.InteropServices.ComVisibleAttribute(true)]
     [System.Runtime.InteropServices.StructLayoutAttribute(System.Runtime.InteropServices.LayoutKind.Sequential)]

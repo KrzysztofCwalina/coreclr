@@ -4849,7 +4849,7 @@ bool                Compiler::optNarrowTree(GenTreePtr     tree,
                         assert(tree->gtType == TYP_INT);
                         op1 = gtNewCastNode(TYP_INT, op1, TYP_INT);
 #ifdef DEBUG
-                        op1->gtFlags |= GTF_MORPHED;
+                        op1->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
                         tree->gtOp.gtOp1 = op1;
                     }
@@ -6832,8 +6832,7 @@ Compiler::fgWalkResult      Compiler::optRemoveTreeVisitor(GenTreePtr *pTree, fg
             //
             if (tree == op1)
             {
-                // This tree and all of its sub trees are being kept 
-                // so we skip marking with GTF_DEAD, etc...
+                // This tree and all of its sub trees are being kept.
                 return WALK_SKIP_SUBTREES;
             }
 
@@ -6844,8 +6843,7 @@ Compiler::fgWalkResult      Compiler::optRemoveTreeVisitor(GenTreePtr *pTree, fg
         }
         if (tree == keptTree)
         {
-            // This tree and all of its sub trees are being kept 
-            // so we skip marking with GTF_DEAD, etc...
+            // This tree and all of its sub trees are being kept.
             return WALK_SKIP_SUBTREES;
         }
     }
@@ -7962,7 +7960,11 @@ void                Compiler::optOptimizeBools()
                 continue;
             if (genTypeSize(t1->TypeGet()) != genTypeSize(t2->TypeGet()))
                 continue;
-
+#ifdef _TARGET_ARMARCH_
+            // Skip the small operand which we cannot encode.
+            if (varTypeIsSmall(c1->TypeGet()))
+                continue;
+#endif
             /* The second condition must not contain side effects */
 
             if  (c2->gtFlags & GTF_GLOB_EFFECT)

@@ -469,7 +469,7 @@ void                Compiler::optAddCopies()
 }
 
 //------------------------------------------------------------------------------
-// optVNConstantPropOnTree: Retrieve the assertions on this local variable
+// GetAssertionDep: Retrieve the assertions on this local variable
 //
 // Arguments:
 //    lclNum - The local var id.
@@ -754,12 +754,13 @@ Compiler::AssertionDsc *  Compiler::optGetAssertion(AssertionIndex assertIndex)
 {
     assert(NO_ASSERTION_INDEX == 0);
     noway_assert(assertIndex != NO_ASSERTION_INDEX);
+    noway_assert(assertIndex <= optAssertionCount);
+    AssertionDsc* assertion = &optAssertionTabPrivate[assertIndex - 1];
+#ifdef DEBUG
+    optDebugCheckAssertion(assertion);
+#endif
 
-    if (assertIndex > optMaxAssertionCount)
-    {
-        return nullptr;
-    }
-    return &optAssertionTabPrivate[assertIndex - 1];
+    return assertion;
 }
 
 /*****************************************************************************
@@ -1488,6 +1489,63 @@ Compiler::AssertionIndex Compiler::optAddAssertion(AssertionDsc* newAssertion)
 }
 
 #ifdef DEBUG
+void Compiler::optDebugCheckAssertion(AssertionDsc* assertion)
+{
+    assert(assertion->assertionKind < OAK_COUNT);
+    assert(assertion->op1.kind < O1K_COUNT);
+    assert(assertion->op2.kind < O2K_COUNT);
+    // It would be good to check that op1.vn and op2.vn are valid value numbers.
+
+    switch(assertion->op1.kind)
+    {
+    case O1K_LCLVAR:
+    case O1K_EXACT_TYPE:
+    case O1K_SUBTYPE:
+        assert(assertion->op1.lcl.lclNum < lvaCount);
+        assert(optLocalAssertionProp ||
+               ((assertion->op1.lcl.ssaNum - SsaConfig::UNINIT_SSA_NUM) < lvaTable[assertion->op1.lcl.lclNum].lvNumSsaNames));
+        break;
+    case O1K_ARR_BND:
+        // It would be good to check that bnd.vnIdx and bnd.vnLen are valid value numbers.
+        break;
+    case O1K_ARRLEN_OPER_BND:
+    case O1K_ARRLEN_LOOP_BND:
+    case O1K_CONSTANT_LOOP_BND:
+        assert(!optLocalAssertionProp);
+        break;
+    default:
+        break;
+    }
+    switch (assertion->op2.kind)
+    {
+    case O2K_IND_CNS_INT:
+    case O2K_CONST_INT:
+    {
+        // The only flags that can be set are those in the GTF_ICON_HDL_MASK, or bit 0, which is
+        // used to indicate a long constant.
+        assert((assertion->op2.u1.iconFlags & ~(GTF_ICON_HDL_MASK|1)) == 0);
+        switch (assertion->op1.kind)
+        {
+        case O1K_EXACT_TYPE:
+        case O1K_SUBTYPE:
+            assert(assertion->op2.u1.iconFlags != 0);
+            break;
+        case O1K_LCLVAR:
+        case O1K_ARR_BND:
+            assert(lvaTable[assertion->op1.lcl.lclNum].lvType != TYP_REF || assertion->op2.u1.iconVal == 0);
+            break;
+        default:
+            break;
+        }
+    }
+    break;
+
+    default:
+        // for all other 'assertion->op2.kind' values we don't check anything
+        break;
+    }
+}
+
 /*****************************************************************************
  *
  *  Verify that assertion prop related assumptions are valid. If "index"
@@ -1502,33 +1560,7 @@ void Compiler::optDebugCheckAssertions(AssertionIndex index)
     for (AssertionIndex ind = start; ind <= end; ++ind)
     {
         AssertionDsc* assertion = optGetAssertion(ind);
-        switch (assertion->op2.kind)
-        {
-        case O2K_IND_CNS_INT:
-        case O2K_CONST_INT:
-           {
-               switch (assertion->op1.kind)
-               {
-               case O1K_EXACT_TYPE:
-               case O1K_SUBTYPE:
-                   assert(assertion->op2.u1.iconFlags != 0);
-                   break;
-               case O1K_ARRLEN_OPER_BND:
-               case O1K_ARRLEN_LOOP_BND:
-               case O1K_CONSTANT_LOOP_BND:
-                   assert(!optLocalAssertionProp);
-                   break;
-               default:
-                   assert(lvaTable[assertion->op1.lcl.lclNum].lvType != TYP_REF || assertion->op2.u1.iconVal == 0);
-                   break;
-               }
-           }
-           break;
-
-        default:
-            // for all other 'assertion->op2.kind' values we don't check anything
-           break;
-        }
+        optDebugCheckAssertion(assertion);
     }
 }
 #endif
@@ -1911,7 +1943,7 @@ void Compiler::optAssertionGen(GenTreePtr tree)
         {
             //  Retrieve the 'this' arg
             GenTreePtr thisArg = gtGetThisArg(tree);
-#if defined(_TARGET_AMD64_) || defined(_TARGET_ARM_)
+#if defined(_TARGET_X86_) || defined(_TARGET_AMD64_) || defined(_TARGET_ARM_)
             if (thisArg == nullptr)
             {
                 // For tail calls we lose the this pointer in the argument list but that's OK because a null check
@@ -1919,7 +1951,7 @@ void Compiler::optAssertionGen(GenTreePtr tree)
                 noway_assert(tree->gtCall.IsTailCall());
                 break;
             }
-#endif // _TARGET_AMD64_ || _TARGET_ARM_
+#endif // _TARGET_X86_ || _TARGET_AMD64_ || _TARGET_ARM_
             noway_assert(thisArg != nullptr);
             assertionIndex = optCreateAssertion(thisArg, nullptr, OAK_NOT_EQUAL);
         }
@@ -2196,18 +2228,54 @@ GenTreePtr Compiler::optVNConstantPropOnTree(BasicBlock* block, GenTreePtr stmt,
     switch (vnStore->TypeOfVN(vnCns))
     {
     case TYP_FLOAT:
-        newTree = optPrepareTreeForReplacement(tree, tree);
-        tree->ChangeOperConst(GT_CNS_DBL);
-        tree->gtDblCon.gtDconVal = vnStore->ConstantValue<float>(vnCns);
-        tree->gtVNPair = ValueNumPair(vnLib, vnCns);
-        break;
+        {
+            float value = vnStore->ConstantValue<float>(vnCns);
+
+            if (tree->TypeGet() == TYP_INT)
+            {
+                // Same sized reinterpretation of bits to integer
+                newTree = optPrepareTreeForReplacement(tree, tree);
+                tree->ChangeOperConst(GT_CNS_INT);
+                tree->gtIntCon.gtIconVal = *(reinterpret_cast<int*>(&value));
+                tree->gtVNPair = ValueNumPair(vnLib, vnCns);
+            }
+            else
+            {
+                // Implicit assignment conversion to float or double
+                assert(varTypeIsFloating(tree->TypeGet()));
+
+                newTree = optPrepareTreeForReplacement(tree, tree);
+                tree->ChangeOperConst(GT_CNS_DBL);
+                tree->gtDblCon.gtDconVal = value;
+                tree->gtVNPair = ValueNumPair(vnLib, vnCns);
+            }
+            break;
+        }
 
     case TYP_DOUBLE:
-        newTree = optPrepareTreeForReplacement(tree, tree);
-        tree->ChangeOperConst(GT_CNS_DBL);
-        tree->gtDblCon.gtDconVal = vnStore->ConstantValue<double>(vnCns);
-        tree->gtVNPair = ValueNumPair(vnLib, vnCns);
-        break;
+        {
+            double value = vnStore->ConstantValue<double>(vnCns);
+
+            if (tree->TypeGet() == TYP_LONG)
+            {
+                // Same sized reinterpretation of bits to long
+                newTree = optPrepareTreeForReplacement(tree, tree);
+                tree->ChangeOperConst(GT_CNS_NATIVELONG);
+                tree->gtIntConCommon.SetLngValue(*(reinterpret_cast<INT64*>(&value)));
+                tree->gtVNPair = ValueNumPair(vnLib, vnCns);
+            }
+            else
+            {
+                // Implicit assignment conversion to float or double
+                assert(varTypeIsFloating(tree->TypeGet()));
+
+                newTree = optPrepareTreeForReplacement(tree, tree);
+                tree->ChangeOperConst(GT_CNS_DBL);
+                tree->gtDblCon.gtDconVal = value;
+                tree->gtVNPair = ValueNumPair(vnLib, vnCns);
+            }
+            break;
+        }
 
     case TYP_LONG:
         {
@@ -2232,6 +2300,7 @@ GenTreePtr Compiler::optVNConstantPropOnTree(BasicBlock* block, GenTreePtr stmt,
                 switch (tree->TypeGet())
                 {
                 case TYP_INT:
+                    // Implicit assignment conversion to smaller integer
                     newTree = optPrepareTreeForReplacement(tree, tree);
                     tree->ChangeOperConst(GT_CNS_INT);
                     tree->gtIntCon.gtIconVal = (int) value;
@@ -2239,6 +2308,7 @@ GenTreePtr Compiler::optVNConstantPropOnTree(BasicBlock* block, GenTreePtr stmt,
                     break;
                     
                 case TYP_LONG:
+                    // Same type no conversion required
                     newTree = optPrepareTreeForReplacement(tree, tree);
                     tree->ChangeOperConst(GT_CNS_NATIVELONG);
                     tree->gtIntConCommon.SetLngValue(value);
@@ -2246,16 +2316,16 @@ GenTreePtr Compiler::optVNConstantPropOnTree(BasicBlock* block, GenTreePtr stmt,
                     break;
                     
                 case TYP_FLOAT:
-                    newTree = optPrepareTreeForReplacement(tree, tree);
-                    tree->ChangeOperConst(GT_CNS_DBL);
-                    tree->gtDblCon.gtDconVal = (float) value;
-                    tree->gtVNPair = ValueNumPair(vnLib, vnCns);
+                    // No implicit conversions from long to float and value numbering will
+                    // not propagate through memory reinterpretations of different size.
+                    unreached();
                     break;
                     
                 case TYP_DOUBLE:
+                    // Same sized reinterpretation of bits to double
                     newTree = optPrepareTreeForReplacement(tree, tree);
                     tree->ChangeOperConst(GT_CNS_DBL);
-                    tree->gtDblCon.gtDconVal = (double) value;
+                    tree->gtDblCon.gtDconVal = *(reinterpret_cast<double*>(&value));
                     tree->gtVNPair = ValueNumPair(vnLib, vnCns);
                     break;
                     
@@ -2302,6 +2372,7 @@ GenTreePtr Compiler::optVNConstantPropOnTree(BasicBlock* block, GenTreePtr stmt,
                 {
                 case TYP_REF:
                 case TYP_INT:
+                    // Same type no conversion required
                     newTree = optPrepareTreeForReplacement(tree, tree);
                     tree->ChangeOperConst(GT_CNS_INT);
                     tree->gtIntCon.gtIconVal = value;
@@ -2310,26 +2381,27 @@ GenTreePtr Compiler::optVNConstantPropOnTree(BasicBlock* block, GenTreePtr stmt,
                     break;
                     
                 case TYP_LONG:
+                    // Implicit assignment conversion to larger integer
                     newTree = optPrepareTreeForReplacement(tree, tree);
                     tree->ChangeOperConst(GT_CNS_NATIVELONG);
-                    tree->gtIntConCommon.SetLngValue((INT64) value);
+                    tree->gtIntConCommon.SetLngValue(value);
                     tree->gtVNPair = ValueNumPair(vnLib, vnCns);
                     break;
                     
                 case TYP_FLOAT:
+                    // Same sized reinterpretation of bits to float
                     newTree = optPrepareTreeForReplacement(tree, tree);
                     tree->ChangeOperConst(GT_CNS_DBL);
-                    tree->gtDblCon.gtDconVal = (float) value;
+                    tree->gtDblCon.gtDconVal = *(reinterpret_cast<float*>(&value));
                     tree->gtVNPair = ValueNumPair(vnLib, vnCns);
                     break;
                     
                 case TYP_DOUBLE:
-                    newTree = optPrepareTreeForReplacement(tree, tree);
-                    tree->ChangeOperConst(GT_CNS_DBL);
-                    tree->gtDblCon.gtDconVal = (double) value;
-                    tree->gtVNPair = ValueNumPair(vnLib, vnCns);
+                    // No implicit conversions from int to double and value numbering will
+                    // not propagate through memory reinterpretations of different size.
+                    unreached();
                     break;
-                    
+
                 default:
                     return nullptr;
                 }
@@ -4242,6 +4314,18 @@ ASSERT_TP* Compiler::optInitAssertionDataflowFlags()
 {
     ASSERT_TP* jumpDestOut = fgAllocateTypeForEachBlk<ASSERT_TP>();
 
+    // The local assertion gen phase may have created unreachable blocks.
+    // They will never be visited in the dataflow propagation phase, so they need to
+    // be initialized correctly. This means that instead of setting their sets to
+    // apFull (i.e. all possible bits set), we need to set the bits only for valid
+    // assertions (note that at this point we are not creating any new assertions).
+    // Also note that assertion indices start from 1.
+    ASSERT_TP apValidFull = optNewEmptyAssertSet();
+    for (int i = 1; i <= optAssertionCount; i++) 
+    {
+        BitVecOps::AddElemD(apTraits, apValidFull, i-1);
+    }
+
     // Initially estimate the OUT sets to everything except killed expressions
     // Also set the IN sets to 1, so that we can perform the intersection.
     // Also, zero-out the flags for handler blocks, as we could be in the
@@ -4250,11 +4334,16 @@ ASSERT_TP* Compiler::optInitAssertionDataflowFlags()
     // edges.
     for (BasicBlock* block = fgFirstBB; block; block = block->bbNext)
     {
-        block->bbAssertionIn  = bbIsHandlerBeg(block) ? optNewEmptyAssertSet() : optNewFullAssertSet();
+        block->bbAssertionIn  = optNewEmptyAssertSet();
+        if (!bbIsHandlerBeg(block))
+        {
+             BitVecOps::Assign(apTraits, block->bbAssertionIn, apValidFull);
+        }
         block->bbAssertionGen = optNewEmptyAssertSet();
-        block->bbAssertionOut = optNewFullAssertSet();
+        block->bbAssertionOut = optNewEmptyAssertSet();
+        BitVecOps::Assign(apTraits, block->bbAssertionOut, apValidFull);
         jumpDestOut[block->bbNum] = optNewEmptyAssertSet();
-        BitVecOps::Assign(apTraits, jumpDestOut[block->bbNum], apFull);
+        BitVecOps::Assign(apTraits, jumpDestOut[block->bbNum], apValidFull);
     }
     // Compute the data flow values for all tracked expressions
     // IN and OUT never change for the initial basic block B1
@@ -4777,9 +4866,9 @@ void Compiler::optAssertionPropMain()
                                                            // and thus we must morph, set order, re-link
             for (GenTreePtr tree = stmt->gtStmt.gtStmtList; tree; tree = tree->gtNext)
             {
-                JITDUMP("Propagating %s assertions for BB%02d, stmt %08X, tree %08X, tree -> %d\n",
-                        BitVecOps::ToString(apTraits, assertions),
-                        block->bbNum, dspPtr(stmt), dspPtr(tree), tree->GetAssertion());
+                JITDUMP("Propagating %s assertions for BB%02d, stmt [%06d], tree [%06d], tree -> %d\n",
+                    BitVecOps::ToString(apTraits, assertions),
+                    block->bbNum, dspTreeID(stmt), dspTreeID(tree), tree->GetAssertion());
 
                 GenTreePtr newTree = optAssertionProp(assertions, tree, stmt);
                 if (newTree)

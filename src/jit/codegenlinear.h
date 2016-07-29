@@ -20,8 +20,6 @@
 
     void                genCodeForMulHi(GenTreeOp* treeNode);
 
-    void                genCodeForPow2Div(GenTreeOp* treeNode);
-
     void                genLeaInstruction(GenTreeAddrMode *lea);
 
     void                genSetRegToCond(regNumber dstReg, GenTreePtr tree);
@@ -51,6 +49,7 @@
 
 #if !defined(_TARGET_64BIT_)
     void                genCompareLong(GenTreePtr treeNode);
+    void                genJTrueLong(GenTreePtr treeNode);
 #endif
 
 #ifdef FEATURE_SIMD

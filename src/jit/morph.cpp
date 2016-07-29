@@ -83,6 +83,19 @@ GenTreePtr          Compiler::fgMorphIntoHelperCall(GenTreePtr      tree,
     tree->gtCall.gtEntryPoint.addr = nullptr;
 #endif
 
+#if defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
+    if (varTypeIsLong(tree))
+    {
+        GenTreeCall* callNode = tree->AsCall();
+        ReturnTypeDesc* retTypeDesc = callNode->GetReturnTypeDesc();
+        retTypeDesc->Reset();
+        retTypeDesc->InitializeLongReturnType(this);
+        callNode->ClearOtherRegs();
+        
+        NYI("Helper with TYP_LONG return type");
+    }
+#endif
+
     /* Perform the morphing */
 
     tree = fgMorphArgs(tree->AsCall());
@@ -770,32 +783,51 @@ unsigned UpdateGT_LISTFlags(GenTreePtr tree)
 #ifdef DEBUG
 void fgArgTabEntry::Dump()
 {
-    if (regNum == REG_STK)
+    printf("fgArgTabEntry[arg %u", argNum);
+    if (regNum != REG_STK)
     {
-        printf("fgArgTabEntry[arg%d, stk%02x, slots=%d", argNum, slotNum, numSlots);
+        printf(", %s, regs=%u", getRegName(regNum), numRegs);
     }
-    else
+    if (numSlots > 0)
     {
-#ifdef _TARGET_ARM64_
-        if (emitter::isFloatReg(regNum))
-        {
-            printf("fgArgTabEntry[arg%d, d%d, regs=%d", argNum, regNum-REG_FP_FIRST, numRegs);
-        }
-        else   // integer register
-        {
-            printf("fgArgTabEntry[arg%d, x%d, regs=%d", argNum, regNum-REG_INT_FIRST, numRegs);
-        }
-#else
-        printf("fgArgTabEntry[arg%02d, r%d, regs=%d", argNum, regNum, numRegs);
-#endif
+        printf(", numSlots=%u, slotNum=%u", numSlots, slotNum);
+    }
+    printf(", align=%u", alignment);
+    if (lateArgInx != (unsigned) -1)
+    {
+        printf(", lateArgInx=%u", lateArgInx);
+    }
+    if (isSplit)
+    {
+        printf(", isSplit");
     }
     if (needTmp)
     {
-        printf(", tmpNum=V%02d", tmpNum);
+        printf(", tmpNum=V%02u", tmpNum);
+    }
+    if (needPlace)
+    {
+        printf(", needPlace");
+    }
+    if (isTmp)
+    {
+        printf(", isTmp");
+    }
+    if (processed)
+    {
+        printf(", processed");
     }
     if (isHfaRegArg)
     {
         printf(", isHfa");
+    }
+    if (isBackFilled)
+    {
+        printf(", isBackFilled");
+    }
+    if (isNonStandard)
+    {
+        printf(", isNonStandard");
     }
     printf("]\n");
 }
@@ -809,6 +841,9 @@ fgArgInfo::fgArgInfo(Compiler *  comp,  GenTreePtr  call, unsigned numArgs)
     nextSlotNum  = INIT_ARG_STACK_SLOT;
     stkLevel     = 0;
     argTableSize = numArgs; // the allocated table size
+
+    hasRegArgs   = false;
+    hasStackArgs = false;
     argsComplete = false;
     argsSorted   = false;
 
@@ -1041,6 +1076,7 @@ fgArgTabEntryPtr fgArgInfo::AddRegArg(unsigned    argNum,
     curArgTabEntry->isBackFilled =      false;
     curArgTabEntry->isNonStandard =     false;
 
+    hasRegArgs = true;
     AddArg(curArgTabEntry);
     return curArgTabEntry;
 }
@@ -1115,6 +1151,7 @@ fgArgTabEntryPtr fgArgInfo::AddStkArg(unsigned    argNum,
     curArgTabEntry->isBackFilled  = false;
     curArgTabEntry->isNonStandard = false;
 
+    hasStackArgs = true;
     AddArg(curArgTabEntry);
 
     nextSlotNum += numSlots;
@@ -1329,22 +1366,6 @@ void fgArgInfo::ArgsComplete()
         assert(curArgTabEntry != NULL);
         GenTreePtr       argx           = curArgTabEntry->node;
 
-#if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-        // If this is a struct, mark it for needing a tempVar.
-        // In the copyblk and store this should have minimal perf impact since 
-        // the local vars where we copy/store to already exist and the logic for temp 
-        // var will not create a new one if it creates a tempVar from another tempVar.
-        // (Debugging through the code, there was no new copy of data created, neither a new tempVar.)
-        // The need for this arise from Lower::LowerArg. 
-        // In case of copyblk and store operation, the NewPutArg method will 
-        // not be invoked and the struct will not be loaded to be passed in
-        // registers or by value on the stack.
-        if (varTypeIsStruct(argx) FEATURE_UNIX_AMD64_STRUCT_PASSING_ONLY( || curArgTabEntry->isStruct))
-        {
-            curArgTabEntry->needTmp = true;
-        }
-#endif // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-
         if (curArgTabEntry->regNum == REG_STK)
         {
             hasStackArgs = true;
@@ -1487,11 +1508,11 @@ void fgArgInfo::ArgsComplete()
         // so we skip this for ARM32 until it is ported to use RyuJIT backend
         //
 #if FEATURE_MULTIREG_ARGS
-        if ((argx->TypeGet() == TYP_STRUCT) &&
-            (curArgTabEntry->numRegs > 1)   && 
-            (curArgTabEntry->needTmp == false))
+        bool isMultiRegArg = (curArgTabEntry->numRegs > 1);
+
+        if ((argx->TypeGet() == TYP_STRUCT) && (curArgTabEntry->needTmp == false))
         {           
-            if ((argx->gtFlags & GTF_PERSISTENT_SIDE_EFFECTS) != 0)
+            if (isMultiRegArg && ((argx->gtFlags & GTF_PERSISTENT_SIDE_EFFECTS) != 0))
             {
                 // Spill multireg struct arguments that have Assignments or Calls embedded in them
                 curArgTabEntry->needTmp = true;
@@ -1501,7 +1522,7 @@ void fgArgInfo::ArgsComplete()
                 // We call gtPrepareCost to measure the cost of evaluating this tree
                 compiler->gtPrepareCost(argx);
 
-                if (argx->gtCostEx > (6 * IND_COST_EX))
+                if (isMultiRegArg && (argx->gtCostEx > (6 * IND_COST_EX)))
                 {
                     // Spill multireg struct arguments that are expensive to evaluate twice
                     curArgTabEntry->needTmp = true;
@@ -1513,6 +1534,21 @@ void fgArgInfo::ArgsComplete()
                     unsigned              structSize = compiler->info.compCompHnd->getClassSize(objClass);
                     switch (structSize)
                     {
+                    case 3:
+                    case 5:
+                    case 6:
+                    case 7:
+                        // If we have a stack based LclVar we can perform a wider read of 4 or 8 bytes
+                        //
+                        if (argObj->gtObj.gtOp1->IsVarAddr() == false)    // Is the source not a LclVar?
+                        {
+                            // If we don't have a LclVar we need to read exactly 3,5,6 or 7 bytes
+                            // For now we use a a GT_CPBLK to copy the exact size into a GT_LCL_VAR temp.
+                            //
+                            curArgTabEntry->needTmp = true;
+                        }
+                        break;
+
                     case 11:
                     case 13:
                     case 14:
@@ -2011,7 +2047,7 @@ GenTreePtr    Compiler::fgMakeTmpArgNode(unsigned tmpVarNum
 #if FEATURE_MULTIREG_ARGS
 #ifdef _TARGET_ARM64_
             assert(varTypeIsStruct(type));
-            if (varDsc->lvIsMultiregStruct())
+            if (lvaIsMultiregStruct(varDsc))
             {
                 // ToDo-ARM64: Consider using:  arg->ChangeOper(GT_LCL_FLD);
                 // as that is how FEATURE_UNIX_AMD64_STRUCT_PASSING works.
@@ -2170,22 +2206,45 @@ void fgArgInfo::EvalArgsToTemps()
                 {
                     setupArg = compiler->gtNewTempAssign(tmpVarNum, argx);
 
+                    LclVarDsc* varDsc = compiler->lvaTable + tmpVarNum;
+
 #ifndef LEGACY_BACKEND
                     if (compiler->fgOrder == Compiler::FGOrderLinear)
                     {
                         // We'll reference this temporary variable just once
                         // when we perform the function call after
                         // setting up this argument.
-                        LclVarDsc* varDsc = compiler->lvaTable + tmpVarNum;
                         varDsc->lvRefCnt = 1;
                     }
 #endif // !LEGACY_BACKEND
 
-                    if (setupArg->OperIsCopyBlkOp())
-                        setupArg = compiler->fgMorphCopyBlock(setupArg);
+                    var_types  lclVarType = genActualType(argx->gtType);
+                    var_types  scalarType = TYP_UNKNOWN;
 
-                    /* Create a copy of the temp to go to the late argument list */
-                    defArg = compiler->gtNewLclvNode(tmpVarNum, genActualType(argx->gtType));
+                    if (setupArg->OperIsCopyBlkOp())
+                    {
+                        setupArg = compiler->fgMorphCopyBlock(setupArg);
+#ifdef _TARGET_ARM64_
+                        // This scalar LclVar widening step is only performed for ARM64 
+                        // 
+                        CORINFO_CLASS_HANDLE clsHnd     = compiler->lvaGetStruct(tmpVarNum);
+                        unsigned             structSize = varDsc->lvExactSize;
+
+                        scalarType = compiler->getPrimitiveTypeForStruct(structSize, clsHnd);
+#endif // _TARGET_ARM64_
+                    }
+
+                    // scalarType can be set to a wider type for ARM64: (3 => 4)  or (5,6,7 => 8)
+                    if ((scalarType != TYP_UNKNOWN) && (scalarType != lclVarType))
+                    {
+                        // Create a GT_LCL_FLD using the wider type to go to the late argument list
+                        defArg = compiler->gtNewLclFldNode(tmpVarNum, scalarType, 0);
+                    }
+                    else
+                    {
+                        // Create a copy of the temp to go to the late argument list
+                        defArg = compiler->gtNewLclvNode(tmpVarNum, lclVarType);
+                    }
 
                     curArgTabEntry->isTmp   = true;
                     curArgTabEntry->tmpNum  = tmpVarNum;
@@ -2282,7 +2341,7 @@ void fgArgInfo::EvalArgsToTemps()
                 {
                     BADCODE("Unhandled struct argument tree in fgMorphArgs");
                 }
-        }
+            }
 
 #endif // !(defined(_TARGET_AMD64_) && !defined(FEATURE_UNIX_AMD64_STRUCT_PASSING))
 
@@ -2543,6 +2602,7 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
     regMaskTP       argSkippedRegMask    = RBM_NONE;
 
 #if defined(_TARGET_ARM_) || defined(_TARGET_AMD64_)
+    // Note this in ONLY used by _TARGET_ARM_
     regMaskTP       fltArgSkippedRegMask = RBM_NONE;
 #endif
 
@@ -2561,19 +2621,124 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
     bool            callIsVararg      = call->IsVarargs();
 #endif
 
-    bool hasNonStandardArg = false;
+#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
+    // If fgMakeOutgoingStructArgCopy is called and copies are generated, hasStackArgCopy is set 
+    // to make sure to call EvalArgsToTemp. fgMakeOutgoingStructArgCopy just marks the argument
+    // to need a temp variable, and EvalArgsToTemp actually creates the temp variable node.
+    bool            hasStackArgCopy = false;
+#endif 
+    
 #ifndef LEGACY_BACKEND
-    // data structure for keeping track of non-standard args we insert
-    // (args that have a special meaning and are not passed following the normal
-    // calling convention or even in the normal arg regs.
-    struct NonStandardArg
+    // Data structure for keeping track of non-standard args. Non-standard args are those that are not passed
+    // following the normal calling convention or in the normal argument registers. We either mark existing
+    // arguments as non-standard (such as the x8 return buffer register on ARM64), or we manually insert the
+    // non-standard arguments into the argument list, below.
+    class NonStandardArgs
     {
-        regNumber reg;
-        GenTree*  node;
-    };
+        struct NonStandardArg
+        {
+            regNumber reg;      // The register to be assigned to this non-standard argument.
+            GenTree*  node;     // The tree node representing this non-standard argument.
+                                //   Note that this must be updated if the tree node changes due to morphing!
+        };
 
-    ArrayStack<NonStandardArg> nonStandardArgs(this, 2);
+        ArrayStack<NonStandardArg> args;
+
+    public:
+        NonStandardArgs(Compiler* compiler)
+            : args(compiler, 3)  // We will have at most 3 non-standard arguments
+        {
+        }
+
+        //-----------------------------------------------------------------------------
+        // Add: add a non-standard argument to the table of non-standard arguments
+        //
+        // Arguments:
+        //    node - a GenTree node that has a non-standard argument.
+        //    reg - the register to assign to this node.
+        //
+        // Return Value:
+        //    None.
+        //
+        void Add(GenTree* node, regNumber reg)
+        {
+            NonStandardArg nsa = { reg, node };
+            args.Push(nsa);
+        }
+
+        //-----------------------------------------------------------------------------
+        // Find: Look for a GenTree* in the set of non-standard args.
+        //
+        // Arguments:
+        //    node - a GenTree node to look for
+        //
+        // Return Value:
+        //    The index of the non-standard argument (a non-negative, unique, stable number).
+        //    If the node is not a non-standard argument, return -1.
+        //
+        int Find(GenTree* node)
+        {
+            for (int i = 0; i < args.Height(); i++)
+            {
+                if (node == args.Index(i).node)
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        //-----------------------------------------------------------------------------
+        // FindReg: Look for a GenTree node in the non-standard arguments set. If found,
+        // set the register to use for the node.
+        //
+        // Arguments:
+        //    node - a GenTree node to look for
+        //    pReg - an OUT argument. *pReg is set to the non-standard register to use if
+        //           'node' is found in the non-standard argument set.
+        //
+        // Return Value:
+        //    'true' if 'node' is a non-standard argument. In this case, *pReg is set to the
+        //          register to use.
+        //    'false' otherwise (in this case, *pReg is unmodified).
+        //
+        bool FindReg(GenTree* node, regNumber* pReg)
+        {
+            for (int i = 0; i < args.Height(); i++)
+            {
+                NonStandardArg& nsa = args.IndexRef(i);
+                if (node == nsa.node)
+                {
+                    *pReg = nsa.reg;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        //-----------------------------------------------------------------------------
+        // Replace: Replace the non-standard argument node at a given index. This is done when
+        // the original node was replaced via morphing, but we need to continue to assign a
+        // particular non-standard arg to it.
+        //
+        // Arguments:
+        //    index - the index of the non-standard arg. It must exist.
+        //    node - the new GenTree node.
+        //
+        // Return Value:
+        //    None.
+        //
+        void Replace(int index, GenTree* node)
+        {
+            args.IndexRef(index).node = node;
+        }
+
+    } nonStandardArgs(this);
 #endif // !LEGACY_BACKEND
+
+    // Count of args. On first morph, this is counted before we've filled in the arg table.
+    // On remorph, we grab it from the arg table.
+    unsigned numArgs = 0;
 
     // Process the late arguments (which were determined by a previous caller).
     // Do this before resetting fgPtrArgCntCur as fgMorphTree(call->gtCallLateArgs)
@@ -2602,11 +2767,12 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
         fgPtrArgCntCur -= callStkLevel;
         assert(call->fgArgInfo != nullptr);
         call->fgArgInfo->RemorphReset();
+
+        numArgs = call->fgArgInfo->ArgCount();
     }
     else
     {
         // First we need to count the args
-        unsigned numArgs = 0;
         if (call->gtCallObjp)
             numArgs++;
         for (args = call->gtCallArgs; (args != nullptr); args = args->gtOp.gtOp2)
@@ -2614,90 +2780,118 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
             numArgs++;
         }
 
+        // Insert or mark non-standard args. These are either outside the normal calling convention, or
+        // arguments registers that don't follow the normal progression of argument registers in the calling
+        // convention (such as for the ARM64 fixed return buffer argument x8).
+        //
+        // *********** NOTE *************
+        // The logic here must remain in sync with GetNonStandardAddedArgCount(), which is used to map arguments
+        // in the implementation of fast tail call.
+        // *********** END NOTE *********
 
-        // insert nonstandard args (outside the calling convention)
+#if !defined(LEGACY_BACKEND) && defined(_TARGET_X86_)
+        // The x86 CORINFO_HELP_INIT_PINVOKE_FRAME helper has a custom calling convention. Set the argument registers
+        // correctly here.
+        if (call->IsHelperCall(this, CORINFO_HELP_INIT_PINVOKE_FRAME))
+        {
+            GenTreeArgList* args = call->gtCallArgs;
+            GenTree* arg1 = args->Current();
+            assert(arg1 != nullptr);
+            nonStandardArgs.Add(arg1, REG_PINVOKE_FRAME);
+        }
+#endif // !defined(LEGACY_BACKEND) && defined(_TARGET_X86_)
 
 #if !defined(LEGACY_BACKEND) && !defined(_TARGET_X86_)
         // TODO-X86-CQ: Currently RyuJIT/x86 passes args on the stack, so this is not needed.
         // If/when we change that, the following code needs to be changed to correctly support the (TBD) managed calling
         // convention for x86/SSE.
-        if (!lateArgsComputed)
+
+        // If we have a Fixed Return Buffer argument register then we setup a non-standard argument for it
+        //
+        if (hasFixedRetBuffReg() && call->HasRetBufArg())
         {
-            if (call->IsUnmanaged() && !opts.ShouldUsePInvokeHelpers())
-            {
-                assert(!call->gtCallCookie);
-                // Add a conservative estimate of the stack size in a special parameter (r11) at the call site.
-                // It will be used only on the intercepted-for-host code path to copy the arguments.             
+            args = call->gtCallArgs; 
+            assert(args != nullptr);
+            assert(args->IsList());
 
-                GenTree* cns = new (this, GT_CNS_INT) GenTreeIntCon(TYP_I_IMPL, fgEstimateCallStackSize(call));
-                call->gtCallArgs = gtNewListNode(cns, call->gtCallArgs);
-                NonStandardArg nsa = {REG_PINVOKE_COOKIE_PARAM, cns};
-                numArgs++;
+            argx = call->gtCallArgs->Current();
 
-                nonStandardArgs.Push(nsa);
-            }
-            else if (call->IsVirtualStub() &&
-                     (call->gtCallType == CT_INDIRECT) &&
-                     !call->IsTailCallViaHelper())
-            {
-                // indirect VSD stubs need the base of the indirection cell to be 
-                // passed in addition.  At this point that is the value in gtCallAddr.
-                // The actual call target will be derived from gtCallAddr in call 
-                // lowering.
+            // We don't increment numArgs here, since we already counted this argument above.
 
-                // If it is a VSD call getting dispatched via tail call helper,
-                // fgMorphTailCall() would materialize stub addr as an additional
-                // parameter added to the original arg list and hence no need to 
-                // add as a non-standard arg.
-                
-                GenTree* arg = call->gtCallAddr;
-                if (arg->OperIsLocal())
-                {
-                    arg = gtClone(arg, true);
-                }
-                else
-                {
-                    call->gtCallAddr = fgInsertCommaFormTemp(&arg);
-                    call->gtFlags |= GTF_ASG;
-                }
-                noway_assert(arg != nullptr);
+            nonStandardArgs.Add(argx, theFixedRetBuffReg());
+        }
+
+        // We are allowed to have a Fixed Return Buffer argument combined
+        // with any of the remaining non-standard arguments
+        //
+        if (call->IsUnmanaged() && !opts.ShouldUsePInvokeHelpers())
+        {
+            assert(!call->gtCallCookie);
+            // Add a conservative estimate of the stack size in a special parameter (r11) at the call site.
+            // It will be used only on the intercepted-for-host code path to copy the arguments.
+
+            GenTree* cns = new (this, GT_CNS_INT) GenTreeIntCon(TYP_I_IMPL, fgEstimateCallStackSize(call));
+            call->gtCallArgs = gtNewListNode(cns, call->gtCallArgs);
+            numArgs++;
+
+            nonStandardArgs.Add(cns, REG_PINVOKE_COOKIE_PARAM);
+        }
+        else if (call->IsVirtualStub() &&
+                 (call->gtCallType == CT_INDIRECT) &&
+                 !call->IsTailCallViaHelper())
+        {
+            // indirect VSD stubs need the base of the indirection cell to be 
+            // passed in addition.  At this point that is the value in gtCallAddr.
+            // The actual call target will be derived from gtCallAddr in call 
+            // lowering.
+
+            // If it is a VSD call getting dispatched via tail call helper,
+            // fgMorphTailCall() would materialize stub addr as an additional
+            // parameter added to the original arg list and hence no need to 
+            // add as a non-standard arg.
             
-                // And push the stub address onto the list of arguments
-                call->gtCallArgs = gtNewListNode(arg, call->gtCallArgs);
-                numArgs++;
-
-                NonStandardArg nsa = {REG_VIRTUAL_STUB_PARAM, arg};
-            
-                nonStandardArgs.Push(nsa);
-            }
-            else if (call->gtCallType == CT_INDIRECT && call->gtCallCookie)
+            GenTree* arg = call->gtCallAddr;
+            if (arg->OperIsLocal())
             {
-                assert(!call->IsUnmanaged());
-
-                // put cookie into R11
-                GenTree* arg = call->gtCallCookie;
-                noway_assert(arg != nullptr);
-                call->gtCallCookie = nullptr;
-
-                call->gtCallArgs = gtNewListNode(arg, call->gtCallArgs);
-                numArgs++;
-
-                NonStandardArg nsa = {REG_PINVOKE_COOKIE_PARAM, arg};
-            
-                nonStandardArgs.Push(nsa);
-
-                // put destination into R10
-                arg = gtClone(call->gtCallAddr, true);
-                call->gtCallArgs = gtNewListNode(arg, call->gtCallArgs);
-                numArgs++;
-
-                NonStandardArg nsa2 = {REG_PINVOKE_TARGET_PARAM, arg};
-                nonStandardArgs.Push(nsa2);
-
-                // finally change this call to a helper call
-                call->gtCallType = CT_HELPER;
-                call->gtCallMethHnd  = eeFindHelper(CORINFO_HELP_PINVOKE_CALLI);
+                arg = gtClone(arg, true);
             }
+            else
+            {
+                call->gtCallAddr = fgInsertCommaFormTemp(&arg);
+                call->gtFlags |= GTF_ASG;
+            }
+            noway_assert(arg != nullptr);
+        
+            // And push the stub address onto the list of arguments
+            call->gtCallArgs = gtNewListNode(arg, call->gtCallArgs);
+            numArgs++;
+
+            nonStandardArgs.Add(arg, REG_VIRTUAL_STUB_PARAM);
+        }
+        else if (call->gtCallType == CT_INDIRECT && call->gtCallCookie)
+        {
+            assert(!call->IsUnmanaged());
+
+            // put cookie into R11
+            GenTree* arg = call->gtCallCookie;
+            noway_assert(arg != nullptr);
+            call->gtCallCookie = nullptr;
+
+            call->gtCallArgs = gtNewListNode(arg, call->gtCallArgs);
+            numArgs++;
+
+            nonStandardArgs.Add(arg, REG_PINVOKE_COOKIE_PARAM);
+
+            // put destination into R10
+            arg = gtClone(call->gtCallAddr, true);
+            call->gtCallArgs = gtNewListNode(arg, call->gtCallArgs);
+            numArgs++;
+
+            nonStandardArgs.Add(arg, REG_PINVOKE_TARGET_PARAM);
+
+            // finally change this call to a helper call
+            call->gtCallType = CT_HELPER;
+            call->gtCallMethHnd  = eeFindHelper(CORINFO_HELP_PINVOKE_CALLI);
         }
 #endif // !defined(LEGACY_BACKEND) && !defined(_TARGET_X86_)
 
@@ -2706,7 +2900,10 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
         call->fgArgInfo = new (this, CMK_Unknown) fgArgInfo(this, call, numArgs);
     }
 
-    fgFixupStructReturn(call);
+    if (varTypeIsStruct(call))
+    {
+        fgFixupStructReturn(call);
+    }
 
     /* First we morph the argument subtrees ('this' pointer, arguments, etc.).
      * During the first call to fgMorphArgs we also record the
@@ -2730,29 +2927,22 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
 
         /* We must fill in or update the argInfo table */
 
-        if  (!lateArgsComputed)
+        if (lateArgsComputed)
+        {
+            /* this is a register argument - possibly update it in the table */
+            call->fgArgInfo->RemorphRegArg(argIndex, argx, NULL, genMapIntRegArgNumToRegNum(intArgRegNum), 1, 1);
+        }
+        else
         {
             assert(varTypeIsGC(call->gtCallObjp->gtType) ||
                    (call->gtCallObjp->gtType == TYP_I_IMPL));
 
             /* this is a register argument - put it in the table */
-            call->fgArgInfo->AddRegArg(argIndex,
-                                       argx, 
-                                       NULL, 
-                                       genMapIntRegArgNumToRegNum(intArgRegNum),
-                                       1, 
-                                       1
+            call->fgArgInfo->AddRegArg(argIndex, argx, NULL, genMapIntRegArgNumToRegNum(intArgRegNum), 1, 1
 #ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-                                       , false,
-                                       REG_STK,
-                                       nullptr
+                                       , false, REG_STK, nullptr
 #endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
-                );
-        }
-        else
-        {
-            /* this is a register argument - possibly update it in the table */
-            call->fgArgInfo->RemorphRegArg(argIndex, argx, NULL, genMapIntRegArgNumToRegNum(intArgRegNum), 1, 1);
+                                        );
         }
         // this can't be a struct.
         assert(argx->gtType != TYP_STRUCT);
@@ -2857,14 +3047,12 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
 #endif // _TARGET_ARM_
 
 #ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-    bool nonRegPassableStruct = false;
     SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR structDesc;
 #endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
 
-    bool expectRetBuffArg      = call->HasRetBufArg();
     bool hasStructArgument     = false;   // @TODO-ARM64-UNIX: Remove this bool during a future refactoring 
     bool hasMultiregStructArgs = false;
-    for (args = call->gtCallArgs; args; args = args->gtOp.gtOp2)
+    for (args = call->gtCallArgs; args; args = args->gtOp.gtOp2, argIndex++)
     {
         GenTreePtr * parentArgx = &args->gtOp.gtOp1;
 
@@ -2875,12 +3063,28 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
         }
 #endif // FEATURE_MULTIREG_ARGS
 
+#ifndef LEGACY_BACKEND
+        // Record the index of any nonStandard arg that we may be processing here, as we are
+        // about to call fgMorphTree on it and fgMorphTree may replace it with a new tree.
+        GenTreePtr orig_argx = *parentArgx;
+        int nonStandard_index = nonStandardArgs.Find(orig_argx);
+#endif // !LEGACY_BACKEND
+
         argx = fgMorphTree(*parentArgx);
         *parentArgx = argx;
         flagsSummary |= argx->gtFlags;
 
         assert(args->IsList());
         assert(argx == args->Current());
+
+#ifndef LEGACY_BACKEND
+        if ((nonStandard_index != -1) && (argx != orig_argx))
+        {
+            // We need to update the node field for this nonStandard arg here
+            // as it was changed by the call to fgMorphTree
+            nonStandardArgs.Replace(nonStandard_index, argx);
+        }
+#endif // !LEGACY_BACKEND
 
         /* Change the node to TYP_I_IMPL so we don't report GC info
          * NOTE: We deferred this from the importer because of the inliner */
@@ -2991,8 +3195,6 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
         {
             passUsingFloatRegs = varTypeIsFloating(argx);
         }
-        bool passUsingIntRegs;
-        passUsingIntRegs = passUsingFloatRegs ? false : (intArgRegNum < MAX_REG_ARG);
 #else // !UNIX_AMD64_ABI
         passUsingFloatRegs = varTypeIsFloating(argx);
 #endif // !UNIX_AMD64_ABI
@@ -3009,10 +3211,6 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
         var_types    structBaseType   = TYP_STRUCT;
         unsigned     structSize = 0;
 
-#if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-        unsigned int structFloatRegs = 0;
-        unsigned int structIntRegs = 0;
-#endif // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
         bool isStructArg = varTypeIsStruct(argx);
 
         if (lateArgsComputed)
@@ -3110,7 +3308,7 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                         }
                     }
                     // Note that there are some additional rules for multireg structs.
-                    // (i.e they cannot be split betwen registers and the stack)
+                    // (i.e they cannot be split between registers and the stack)
                 }
                 else
                 {
@@ -3167,7 +3365,7 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                 }
                 else // We must have a GT_OBJ with a struct type, but the GT_OBJ may be be a child of a GT_COMMA
                 {
-                    GenTreePtr   argObj         = argx;
+                    GenTreePtr   argObj = argx;
                     GenTreePtr*  parentOfArgObj = parentArgx;
 
                     assert(args->IsList());
@@ -3177,7 +3375,7 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                     while (argObj->gtOper == GT_COMMA)
                     {
                         parentOfArgObj = &argObj->gtOp.gtOp2;
-                        argObj         = argObj->gtOp.gtOp2;
+                        argObj = argObj->gtOp.gtOp2;
                     }
 
                     if (argObj->gtOper != GT_OBJ)
@@ -3190,9 +3388,25 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
 
                     unsigned originalSize = info.compCompHnd->getClassSize(objClass);
                     originalSize = (originalSize == 0 ? TARGET_POINTER_SIZE : originalSize);
-                    unsigned roundupSize  = (unsigned)roundUp(originalSize, TARGET_POINTER_SIZE);
+                    unsigned roundupSize = (unsigned)roundUp(originalSize, TARGET_POINTER_SIZE);
 
                     structSize = originalSize;
+
+                    structPassingKind howToPassStruct;
+                    structBaseType = getArgTypeForStruct(objClass, &howToPassStruct, originalSize);
+
+#ifdef _TARGET_ARM64_
+                    if ((howToPassStruct == SPK_PrimitiveType) &&     // Passed in a single register
+                        !isPow2(originalSize))                        // size is 3,5,6 or 7 bytes
+                    {
+                        if (argObj->gtObj.gtOp1->IsVarAddr())         // Is the source a LclVar?
+                        {
+                            // For ARM64 we pass structs that are 3,5,6,7 bytes in size 
+                            // we can read 4 or 8 bytes from the LclVar to pass this arg
+                            originalSize = genTypeSize(structBaseType);
+                        }
+                    }
+#endif //  _TARGET_ARM64_
 
 #ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
                     // On System V OS-es a struct is never passed by reference.
@@ -3202,20 +3416,25 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                     bool     passStructByRef = false;
 #endif // !FEATURE_UNIX_AMD64_STRUCT_PASSING
 
-                    // The following if-then-else needs to be carefully refactored
-                    // Basically the else portion wants to turn a struct load (a GT_OBJ)'
+                    // The following if-then-else needs to be carefully refactored.
+                    // Basically the else portion wants to turn a struct load (a GT_OBJ)
                     // into a GT_IND of the appropriate size. 
-                    // It can do this with structs sizes that are 1,2,4, or 8 bytes
+                    // It can do this with structs sizes that are 1, 2, 4, or 8 bytes.
                     // It can't do this when FEATURE_UNIX_AMD64_STRUCT_PASSING is defined  (Why?)
-                    // TODO-Cleanup: Remove the #ifndef FEATURE_UNIX_AMD64_STRUCT_PASSING below
+                    // TODO-Cleanup: Remove the #ifndef FEATURE_UNIX_AMD64_STRUCT_PASSING below.
                     // It also can't do this if we have a HFA arg, 
-                    // unless we have a 1-elem HFA in which case we want to do the optization
-                    // 
+                    // unless we have a 1-elem HFA in which case we want to do the optimization.
+
 #ifndef _TARGET_X86_
 #ifndef FEATURE_UNIX_AMD64_STRUCT_PASSING
                     // Check for struct argument with size 1, 2, 4 or 8 bytes
                     // As we can optimize these by turning them into a GT_IND of the correct type
-                    if ((originalSize > TARGET_POINTER_SIZE) || ((originalSize & (originalSize - 1)) != 0) || (isHfaArg && (hfaSlots != 1)))
+                    //
+                    // Check for cases that we cannot optimize:
+                    //
+                    if ((originalSize > TARGET_POINTER_SIZE) ||  // it is struct that is larger than a pointer
+                        !isPow2(originalSize)                ||  // it is not a power of two (1, 2, 4 or 8)
+                        (isHfaArg && (hfaSlots != 1)))           // it is a one element HFA struct
 #endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
                     {
                         // Normalize 'size' to the number of pointer sized items
@@ -3229,15 +3448,64 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
 #else // FEATURE_UNIX_AMD64_STRUCT_PASSING
                         if (!structDesc.passedInRegisters)
                         {
+                            GenTreePtr lclVar = fgIsIndirOfAddrOfLocal(argObj);
+                            bool needCpyBlk = false;
+                            if (lclVar != nullptr)
+                            {
+                                // If the struct is promoted to registers, it has to be materialized
+                                // on stack. We may want to support promoted structures in
+                                // codegening pugarg_stk instead of creating a copy here.
+                                LclVarDsc*  varDsc = &lvaTable[lclVar->gtLclVarCommon.gtLclNum];
+                                needCpyBlk = varDsc->lvPromoted;
+                            }
+                            else 
+                            {
+                                // If simd16 comes from vector<t>, eeGetSystemVAmd64PassStructInRegisterDescriptor
+                                // sets structDesc.passedInRegisters to be false.
+                                //
+                                // GT_ADDR(GT_SIMD) is not a rationalized IR form and is not handled 
+                                // by rationalizer. For now we will let SIMD struct arg to be copied to 
+                                // a local. As part of cpblk rewrite, rationalizer will handle GT_ADDR(GT_SIMD)                                
+                                //                                
+                                // +--*  obj       simd16
+                                // |  \--*  addr      byref
+                                // |     |  /--*  lclVar    simd16 V05 loc4
+                                // |     \--*  simd      simd16 int -
+                                // |        \--*  lclVar    simd16 V08 tmp1
+                                //
+                                // TODO-Amd64-Unix: The rationalizer can be updated to handle this pattern,
+                                // so that we don't need to generate a copy here.
+                                GenTree* addr = argObj->gtOp.gtOp1;
+                                if (addr->OperGet() == GT_ADDR) 
+                                {
+                                    GenTree* addrChild = addr->gtOp.gtOp1;
+                                    if (addrChild->OperGet() == GT_SIMD) 
+                                    {
+                                        needCpyBlk = true;
+                                    }                                    
+                                }
+                            }
                             passStructInRegisters = false;
-                            copyBlkClass = NO_CLASS_HANDLE;
+                            if (needCpyBlk)
+                            {
+                                copyBlkClass = objClass;
+                            }
+                            else
+                            {                                
+                                copyBlkClass = NO_CLASS_HANDLE;
+                            }
                         }
                         else
                         {
                             // The objClass is used to materialize the struct on stack.
+                            // For SystemV, the code below generates copies for struct arguments classified 
+                            // as register argument. 
+                            // TODO-Amd64-Unix: We don't always need copies for this case. Struct arguments
+                            // can be passed on registers or can be copied directly to outgoing area. 
                             passStructInRegisters = true;
                             copyBlkClass = objClass;
                         }
+                        
 #endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
 #elif defined(_TARGET_ARM64_)
                         if ((size > 2) && !isHfaArg)
@@ -3267,17 +3535,23 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
 #endif // _TARGET_ARM_
                     }
 #ifndef FEATURE_UNIX_AMD64_STRUCT_PASSING
+                    // TODO-Amd64-Unix: Since the else part below is disabled for UNIX_AMD64, copies are always
+                    // generated for struct 1, 2, 4, or 8. 
                     else   // We have a struct argument with size 1, 2, 4 or 8 bytes
                     {
                         // change our GT_OBJ into a GT_IND of the correct type.
                         // We've already ensured above that size is a power of 2, and less than or equal to pointer size.
-                        structBaseType = argOrReturnTypeForStruct(originalSize, objClass, false /* forReturn */);
+
+                        assert(howToPassStruct == SPK_PrimitiveType);
+
+                        // ToDo: remove this block as getArgTypeForStruct properly handles turning one element HFAs into primitives
                         if (isHfaArg)
                         {
                             // If we reach here with an HFA arg it has to be a one element HFA
                             assert(hfaSlots == 1);
                             structBaseType = hfaType;   // change the indirection type to a floating point type
                         }
+
                         noway_assert(structBaseType != TYP_UNKNOWN);
 
                         argObj->ChangeOper(GT_IND);
@@ -3402,19 +3676,9 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                                 // There are a few special cases where we can omit using a CopyBlk
                                 // where we normally would need to use one.
 
-                                GenTreePtr  objAddr = argObj->gtObj.gtOp1;
-                                if (objAddr->gtOper == GT_ADDR)
+                                if (argObj->gtObj.gtOp1->IsVarAddr())         // Is the source a LclVar?
                                 {
-                                    // exception : no need to use CopyBlk if the valuetype is on the stack
-                                    if (objAddr->gtFlags & GTF_ADDR_ONSTACK)
-                                    {
-                                        copyBlkClass = NO_CLASS_HANDLE;
-                                    }
-                                    // exception : no need to use CopyBlk if the valuetype is already a struct local
-                                    else if (objAddr->gtOp.gtOp1->gtOper == GT_LCL_VAR)
-                                    {
-                                        copyBlkClass = NO_CLASS_HANDLE;
-                                    }
+                                    copyBlkClass = NO_CLASS_HANDLE;
                                 }
                             }
 
@@ -3423,10 +3687,14 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                         }
                     }
                 }
+
+#ifndef _TARGET_X86_
+                // TODO-Arm: Does this apply for _TARGET_ARM_, where structs passed by value can be split between registers and stack? 
                 if (size > 1)
                 {
                     hasMultiregStructArgs = true;
                 }
+#endif // !_TARGET_X86_
             }
 
             // The 'size' value has now must have been set. (the original value of zero is an invalid value)
@@ -3435,23 +3703,12 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
             //
             // Figure out if the argument will be passed in a register.
             //
-            bool passedInRegisters = true;
-#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-            passedInRegisters = !isStructArg;
-            if (!passedInRegisters)
-            {
-                if (structDesc.passedInRegisters)
-                {
-                    passedInRegisters = true;
-                }
-                else
-                {
-                    passedInRegisters = false;
-                }
-            }
 
+            if (isRegParamType(genActualType(argx->TypeGet()))
+#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
+                && (!isStructArg || structDesc.passedInRegisters)
 #endif
-            if (passedInRegisters && isRegParamType(genActualType(argx->TypeGet())))
+                )
             {
 #ifdef _TARGET_ARM_
                 if (passUsingFloatRegs)
@@ -3482,7 +3739,7 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                 {
                     isRegArg = intArgRegNum < MAX_REG_ARG;
                 }
-#elif _TARGET_ARM64_
+#elif defined(_TARGET_ARM64_)
                 if (passUsingFloatRegs)
                 {
                     // Check if the last register needed is still in the fp argument register range.
@@ -3495,12 +3752,30 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                         //
                         unsigned roundupSize = (unsigned)roundUp(structSize, TARGET_POINTER_SIZE);
                         size = roundupSize / TARGET_POINTER_SIZE;
+
+                        // We also must update fltArgRegNum so that we no longer try to 
+                        // allocate any new floating point registers for args
+                        // This prevents us from backfilling a subsequent arg into d7 
+                        //
+                        fltArgRegNum = MAX_FLOAT_REG_ARG;
                     }
                 }
                 else
                 {
                     // Check if the last register needed is still in the int argument register range.
                     isRegArg = (intArgRegNum + (size - 1)) < maxRegArgs;
+
+                    // Did we run out of registers when we had a 16-byte struct (size===2) ?
+                    // (i.e we only have one register remaining but we needed two registers to pass this arg)
+                    // This prevents us from backfilling a subsequent arg into x7
+                    //
+                    if (!isRegArg && (size > 1))
+                    {
+                        // We also must update intArgRegNum so that we no longer try to 
+                        // allocate any new general purpose registers for args
+                        //
+                        intArgRegNum = maxRegArgs;
+                    }
                 }
 #else // not _TARGET_ARM_ or _TARGET_ARM64_
 
@@ -3511,6 +3786,8 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                 // Now make sure there are actually enough registers to do so.
                 if (isStructArg)
                 {
+                    unsigned int structFloatRegs = 0;
+                    unsigned int structIntRegs = 0;
                     for (unsigned int i = 0; i < structDesc.eightByteCount; i++)
                     {
                         if (structDesc.IsIntegralSlot(i))
@@ -3523,17 +3800,8 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                         }
                     }
 
-                    if (((nextFltArgRegNum + structFloatRegs) > MAX_FLOAT_REG_ARG) ||
-                        ((intArgRegNum + structIntRegs) > MAX_REG_ARG))
-                    {
-                        isRegArg = false;
-                        nonRegPassableStruct = true;
-                    }
-                    else
-                    {
-                        isRegArg = true;
-                        nonRegPassableStruct = false;
-                    }
+                    isRegArg = ((nextFltArgRegNum + structFloatRegs) <= MAX_FLOAT_REG_ARG) &&
+                               ((intArgRegNum + structIntRegs) <= MAX_REG_ARG);
                 }
                 else
 #endif // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
@@ -3548,19 +3816,30 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
                     }
                 }
 #else // !defined(UNIX_AMD64_ABI)
-                isRegArg = (intArgRegNum+(size-1)) < maxRegArgs;
+                isRegArg = (intArgRegNum + (size - 1)) < maxRegArgs;
 #endif // !defined(UNIX_AMD64_ABI)
 #endif // _TARGET_ARM_
             }
             else
             {
                 isRegArg = false;
-
-#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-                nonRegPassableStruct = true;
-#endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
             }
-        }
+
+#if defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
+            if (call->IsTailCallViaHelper())
+            {
+                // We have already (before calling fgMorphArgs()) appended the 4 special args
+                // required by the x86 tailcall helper. These args are required to go on the
+                // stack. Force them to the stack here.
+                assert(numArgs >= 4);
+                if (argIndex >= numArgs - 4)
+                {
+                    isRegArg = false;
+                }
+            }
+#endif // defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
+
+        } // end !lateArgsComputed
 
         //
         // Now we know if the argument goes in registers or not and how big it is,
@@ -3596,74 +3875,31 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
         }
 
 #endif // _TARGET_ARM_
+
         if (isRegArg)
         {
             regNumber nextRegNum = REG_STK;
 #if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
             regNumber nextOtherRegNum = REG_STK;
+            unsigned int structFloatRegs = 0;
+            unsigned int structIntRegs = 0;
 
             if (isStructArg && structDesc.passedInRegisters)
             {
                 // It is a struct passed in registers. Assign the next available register.
-                unsigned int curIntReg = intArgRegNum;
-                unsigned int curFloatReg = nextFltArgRegNum;
+                assert((structDesc.eightByteCount <= 2) && "Too many eightbytes.");
+                regNumber* nextRegNumPtrs[2] = { &nextRegNum, &nextOtherRegNum };
                 for (unsigned int i = 0; i < structDesc.eightByteCount; i++)
                 {
                     if (structDesc.IsIntegralSlot(i))
                     {
-                        if (i == 0)
-                        {
-                            nextRegNum = genMapIntRegArgNumToRegNum(curIntReg);
-
-                            // For non-completed args the counters are incremented already
-                            // in the !lateArgsComputed above.
-                            if (lateArgsComputed)
-                            {
-                                structIntRegs++;
-                            }
-                        }
-                        else if (i == 1)
-                        {
-                            nextOtherRegNum = genMapIntRegArgNumToRegNum(curIntReg);
-
-                            if (lateArgsComputed)
-                            {
-                                structIntRegs++;
-                            }
-                        }
-                        else
-                        {
-                            assert(false && "fgMorphArgs Invalid index for int classification.");
-                        }
-
-                        curIntReg++;
+                        *nextRegNumPtrs[i] = genMapIntRegArgNumToRegNum(intArgRegNum + structIntRegs);
+                        structIntRegs++;
                     }
                     else if (structDesc.IsSseSlot(i))
                     {
-                        if (i == 0)
-                        {
-                            nextRegNum = genMapFloatRegArgNumToRegNum(curFloatReg);
-
-                            if (lateArgsComputed)
-                            {
-                                structFloatRegs++;
-                            }
-                        }
-                        else if (i == 1)
-                        {
-                            nextOtherRegNum = genMapFloatRegArgNumToRegNum(curFloatReg);
-
-                            if (lateArgsComputed)
-                            {
-                                structFloatRegs++;
-                            }
-                        }
-                        else
-                        {
-                            assert(false && "fgMorphArgs Invalid index for SSE classification.");
-                        }
-
-                        curFloatReg++;
+                        *nextRegNumPtrs[i] = genMapFloatRegArgNumToRegNum(nextFltArgRegNum + structFloatRegs);
+                        structFloatRegs++;
                     }
                 }
             }
@@ -3679,94 +3915,44 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
             assert(size == 1);
 #endif
 #endif
-            // If 'expectRetBuffArg' is true then the next argument is the RetBufArg
-            // and we may need to change nextRegNum to the theFixedRetBuffReg
-            //
-            if (expectRetBuffArg)
+
+            fgArgTabEntryPtr newArgEntry;
+            if (lateArgsComputed)
             {
-                assert(passUsingFloatRegs == false);
-              
-                if (hasFixedRetBuffReg())
-                {
-                    // Change the register used to pass the next argument to the fixed return buffer register
-                    nextRegNum = theFixedRetBuffReg();
-                    // Note that later in this method we don't increment intArgRegNum when we 
-                    // have setup nextRegRun to be the fixed retrurn buffer register
-                }
-
-                // We no longer are expecting the RetBufArg
-                expectRetBuffArg = false;
-            }
-
-#ifndef LEGACY_BACKEND
-            // If there are nonstandard args (outside the calling convention) they were inserted above
-            // and noted them in a table so we can recognize them here and build their argInfo.
-            // 
-            // They should not affect the placement of any other args or stack space required.
-            // Example: on AMD64 R10 and R11 are used for indirect VSD (generic interface) and cookie calls.
-            bool nonStandardFound = false;
-            for (int i=0; i<nonStandardArgs.Height(); i++)
-            {
-                hasNonStandardArg = true;
-                if (argx == nonStandardArgs.Index(i).node)
-                {
-                    fgArgTabEntry* argEntry = call->fgArgInfo->AddRegArg(argIndex, 
-                                                                         argx,
-                                                                         args, 
-                                                                         nonStandardArgs.Index(i).reg, 
-                                                                         size, 
-                                                                         argAlign
-#if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-                                                                         , isStructArg, 
-                                                                         nextOtherRegNum, 
-                                                                         &structDesc
-#endif // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-                    );
-                    argEntry->isNonStandard = true;
-                    argIndex++;
-                    nonStandardFound = true;
-                    break;
-                }
-            }
-            if (nonStandardFound)
-                continue;
-#endif // !LEGACY_BACKEND
-
-            if (!lateArgsComputed)
-            {
-                // This is a register argument - put it in the table
-                fgArgTabEntryPtr newArg = call->fgArgInfo->AddRegArg(argIndex, 
-                                                                     argx, 
-                                                                     args, 
-                                                                     nextRegNum, 
-                                                                     size, 
-                                                                     argAlign
-#if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-                                                                     , isStructArg, 
-                                                                     nextOtherRegNum, 
-                                                                     &structDesc
-#endif // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-                    );
-                (void)newArg; //prevent "unused variable" error from GCC
-
-                newArg->SetIsHfaRegArg(passUsingFloatRegs && isHfaArg); // Note on Arm32 a HFA is passed in int regs for varargs
-
-#ifdef _TARGET_ARM_
-                newArg->SetIsBackFilled(isBackFilled);
-#endif // _TARGET_ARM_
+                // This is a register argument - possibly update it in the table
+                newArgEntry = call->fgArgInfo->RemorphRegArg(argIndex, argx, args, nextRegNum, size, argAlign);
             }
             else
             {
-                // This is a register argument - possibly update it in the table
-                fgArgTabEntryPtr entry = call->fgArgInfo->RemorphRegArg(argIndex, argx, args, nextRegNum, size, argAlign);
-                if (entry->isNonStandard)
-                {
-                    argIndex++;
-                    continue;
-                }
+                bool isNonStandard = false;
+
+#ifndef LEGACY_BACKEND
+                // If there are nonstandard args (outside the calling convention) they were inserted above
+                // and noted them in a table so we can recognize them here and build their argInfo.
+                // 
+                // They should not affect the placement of any other args or stack space required.
+                // Example: on AMD64 R10 and R11 are used for indirect VSD (generic interface) and cookie calls.
+                isNonStandard = nonStandardArgs.FindReg(argx, &nextRegNum);
+#endif // !LEGACY_BACKEND
+
+                // This is a register argument - put it in the table
+                newArgEntry = call->fgArgInfo->AddRegArg(argIndex, argx, args, nextRegNum, size, argAlign
+#if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+                                                    , isStructArg, nextOtherRegNum, &structDesc
+#endif // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+                                                    );
+
+                newArgEntry->SetIsHfaRegArg(passUsingFloatRegs && isHfaArg); // Note on Arm32 a HFA is passed in int regs for varargs
+                newArgEntry->SetIsBackFilled(isBackFilled);
+                newArgEntry->isNonStandard = isNonStandard;
             }
 
-            // Setup the next argRegNum value
+            if (newArgEntry->isNonStandard)
+            {
+                continue;
+            }
+
+            // Set up the next intArgRegNum and fltArgRegNum values.
             if (!isBackFilled)
             {
 #if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
@@ -3839,22 +4025,34 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
 
             // If the register arguments have not been determined then we must fill in the argInfo
 
-            if  (!lateArgsComputed)
-            {
-                // This is a stack argument - put it in the table
-                call->fgArgInfo->AddStkArg(argIndex, argx, args, size, argAlign FEATURE_UNIX_AMD64_STRUCT_PASSING_ONLY_ARG(isStructArg));
-
-            }
-            else
+            if  (lateArgsComputed)
             {
                 // This is a stack argument - possibly update it in the table
                 call->fgArgInfo->RemorphStkArg(argIndex, argx, args, size, argAlign);
             }
+            else
+            {
+                // This is a stack argument - put it in the table
+                call->fgArgInfo->AddStkArg(argIndex, argx, args, size, argAlign FEATURE_UNIX_AMD64_STRUCT_PASSING_ONLY_ARG(isStructArg));
+            }
         }
+
         if (copyBlkClass != NO_CLASS_HANDLE)
         {
             noway_assert(!lateArgsComputed);
             fgMakeOutgoingStructArgCopy(call, args, argIndex, copyBlkClass FEATURE_UNIX_AMD64_STRUCT_PASSING_ONLY_ARG(&structDesc));
+
+            // This can cause a GTF_EXCEPT flag to be set.
+            // TODO-CQ: Fix the cases where this happens. We shouldn't be adding any new flags.
+            // This currently occurs in the case where we are re-morphing the args on x86/RyuJIT, and
+            // there are no register arguments. Then lateArgsComputed is never true, so we keep re-copying
+            // any struct arguments.
+            // i.e. assert(((call->gtFlags & GTF_EXCEPT) != 0) || ((args->Current()->gtFlags & GTF_EXCEPT) == 0)
+            flagsSummary |= (args->Current()->gtFlags & GTF_EXCEPT);
+            
+#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING            
+            hasStackArgCopy = true;
+#endif
         }
 
 #ifndef LEGACY_BACKEND
@@ -3869,7 +4067,6 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
             // Here we don't need unsafe value cls check since the addr of temp is used only in mkrefany
             unsigned   tmp = lvaGrabTemp(true DEBUGARG("by-value mkrefany struct argument"));
             lvaSetStruct(tmp, impGetRefAnyClass(), false);
-
 
             // Build the mkrefany as a comma node:
             // (tmp.ptr=argx),(tmp.type=handle)
@@ -3893,9 +4090,8 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
         }
 #endif // !LEGACY_BACKEND
 
-        argIndex++;
 #ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-        if (nonRegPassableStruct)
+        if (isStructArg && !isRegArg)
         {
             nonRegPassedStructSlots += size;
         }
@@ -3962,13 +4158,10 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
         // First slots go in registers only, no stack needed.
         // TODO-Amd64-Unix-CQ This calculation is only accurate for integer arguments,
         // and ignores floating point args (it is overly conservative in that case).
-        if (argSlots <= MAX_REG_ARG)
+        preallocatedArgCount = nonRegPassedStructSlots;
+        if (argSlots > MAX_REG_ARG)
         {
-            preallocatedArgCount = nonRegPassedStructSlots;
-        }
-        else
-        {
-            preallocatedArgCount = argSlots + nonRegPassedStructSlots - MAX_REG_ARG;
+            preallocatedArgCount += argSlots - MAX_REG_ARG;
         }
 #endif  // UNIX_AMD64_ABI
 
@@ -4002,16 +4195,17 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
     call->gtFlags |= (flagsSummary & GTF_ALL_EFFECT);
 
     // If the register arguments have already been determined
-    // or we have no register arguments then we are done.
-
-    bool needEvalArgsToTemps = true;
-
-    if (lateArgsComputed || (intArgRegNum == 0 && fltArgRegNum == 0 && !hasNonStandardArg && !hasStructArgument))
-    {
-        needEvalArgsToTemps = false;
-    }
-
-    if (needEvalArgsToTemps)
+    // or we have no register arguments then we don't need to 
+    // call SortArgs() and EvalArgsToTemps()
+    //
+    // For UNIX_AMD64, the condition without hasStackArgCopy cannot catch
+    // all cases of fgMakeOutgoingStructArgCopy() being called. hasStackArgCopy
+    // is added to make sure to call EvalArgsToTemp.
+    if (!lateArgsComputed && (call->fgArgInfo->HasRegArgs()
+ #ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
+                              || hasStackArgCopy
+ #endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
+                              ))
     {
         // This is the first time that we morph this call AND it has register arguments.
         // Follow into the code below and do the 'defer or eval to temp' analysis.
@@ -4050,7 +4244,6 @@ GenTreeCall* Compiler::fgMorphArgs(GenTreeCall* callNode)
     if (verbose)
     {
         fgArgInfoPtr argInfo = call->fgArgInfo;
-
         for (unsigned curInx = 0; curInx < argInfo->ArgCount(); curInx++)
         {
             fgArgTabEntryPtr curArgEntry = argInfo->ArgTable()[curInx];
@@ -4281,14 +4474,14 @@ void Compiler::fgMorphMultiregStructArgs(GenTreeCall* call)
     NYI_ARM("fgMorphMultiregStructArgs");
 #endif
 #ifdef _TARGET_X86_
-    assert("Logic error: no MultiregStructArgs for X86");
+    assert(!"Logic error: no MultiregStructArgs for X86");
 #endif
 #ifdef _TARGET_AMD64_
 #if defined(UNIX_AMD64_ABI)
     NYI_AMD64("fgMorphMultiregStructArgs (UNIX ABI)");
-#else
-#endif
-    assert("Logic error: no MultiregStructArgs for Windows X64 ABI");
+#else // !UNIX_AMD64_ABI
+    assert(!"Logic error: no MultiregStructArgs for Windows X64 ABI");
+#endif // !UNIX_AMD64_ABI
 #endif
 
     for (args = call->gtCallArgs; args != nullptr; args = args->gtOp.gtOp2)
@@ -4501,7 +4694,7 @@ GenTreePtr    Compiler::fgMorphMultiregStructArg(GenTreePtr arg, fgArgTabEntryPt
         //
         assert((varDsc->lvSize() == 2*TARGET_POINTER_SIZE) || varDsc->lvIsHfa());
 
-        varDsc->lvIsMultiRegArgOrRet = true;
+        varDsc->lvIsMultiRegArg = true;
 
 #ifdef DEBUG
         if (verbose)
@@ -4552,7 +4745,7 @@ GenTreePtr    Compiler::fgMorphMultiregStructArg(GenTreePtr arg, fgArgTabEntryPt
 
         // Is this LclVar a promoted struct with exactly 2 fields?
         // TODO-ARM64-CQ: Support struct promoted HFA types here
-        if (varDsc->lvPromoted && (varDsc->lvFieldCnt == 2))
+        if (varDsc->lvPromoted && (varDsc->lvFieldCnt == 2) && !varDsc->lvIsHfa())
         {
             // See if we have two promoted fields that start at offset 0 and 8?
             unsigned loVarNum = lvaGetFieldLocal(varDsc, 0);
@@ -4761,29 +4954,30 @@ Compiler::fgMakeOutgoingStructArgCopy(GenTreeCall* call,
     // See if we need to insert a copy at all
     // Case 1: don't need a copy if it is the last use of a local.  We can't determine that all of the time
     // but if there is only one use and no loops, the use must be last.
-    if (argx->gtOper == GT_OBJ)
+    GenTreeLclVarCommon* lcl = nullptr;
+    if ((argx->OperGet() == GT_OBJ) && argx->AsObj()->Addr()->OperIsLocal())
     {
-        GenTree* lcl = argx->gtOp.gtOp1;
-        if (lcl->OperIsLocal())
+        lcl = argx->AsObj()->Addr()->AsLclVarCommon();
+    }
+    if (lcl != nullptr)
+    {
+        unsigned varNum = lcl->AsLclVarCommon()->GetLclNum();
+        if (lvaIsImplicitByRefLocal(varNum))
         {
-            unsigned varNum = lcl->AsLclVarCommon()->GetLclNum();
-            if (lvaIsImplicitByRefLocal(varNum))
+            LclVarDsc* varDsc = &lvaTable[varNum];
+            // JIT_TailCall helper has an implicit assumption that all tail call arguments live
+            // on the caller's frame. If an argument lives on the caller caller's frame, it may get
+            // overwritten if that frame is reused for the tail call. Therefore, we should always copy
+            // struct parameters if they are passed as arguments to a tail call.
+            if (!call->IsTailCallViaHelper() && (varDsc->lvRefCnt == 1) && !fgMightHaveLoop())
             {
-                LclVarDsc* varDsc = &lvaTable[varNum];
-                // JIT_TailCall helper has an implicit assumption that all tail call arguments live
-                // on the caller's frame. If an argument lives on the caller caller's frame, it may get
-                // overwritten if that frame is reused for the tail call. Therefore, we should always copy
-                // struct parameters if they are passed as arguments to a tail call.
-                if (!call->IsTailCallViaHelper() && (varDsc->lvRefCnt == 1) && !fgMightHaveLoop())
-                {
-                    varDsc->lvRefCnt = 0;
-                    args->gtOp.gtOp1 = lcl;
-                    fgArgTabEntryPtr fp = Compiler::gtArgEntryByNode(call, argx);
-                    fp->node = lcl;
+                varDsc->lvRefCnt = 0;
+                args->gtOp.gtOp1 = lcl;
+                fgArgTabEntryPtr fp = Compiler::gtArgEntryByNode(call, argx);
+                fp->node = lcl;
 
-                    JITDUMP("did not have to make outgoing copy for V%2d", varNum);
-                    return;
-                }
+                JITDUMP("did not have to make outgoing copy for V%2d", varNum);
+                return;
             }
         }
     }
@@ -4918,38 +5112,68 @@ void                Compiler::fgAddSkippedRegsInPromotedStructArg(LclVarDsc* var
 #endif // _TARGET_ARM_
 
 
-/*****************************************************************************
- *
- *  The companion to impFixupCallStructReturn.  Now that the importer is done
- *  and we no longer care as much about the declared return type, change to
- *  precomputed native return type (at least for architectures that don't
- *  always use return buffers for structs).
- *
- */
+//****************************************************************************
+//  fgFixupStructReturn:
+//    The companion to impFixupCallStructReturn.  Now that the importer is done
+//    change the gtType to the precomputed native return type 
+//    requires that callNode currently has a struct type
+//
 void                Compiler::fgFixupStructReturn(GenTreePtr     callNode)
 {
+    assert(varTypeIsStruct(callNode));
+
     GenTreeCall* call = callNode->AsCall();
     bool callHasRetBuffArg = call->HasRetBufArg();
+    bool isHelperCall = call->IsHelperCall();
 
-    if (!callHasRetBuffArg && varTypeIsStruct(call))
+    // Decide on the proper return type for this call that currently returns a struct
+    //
+    CORINFO_CLASS_HANDLE         retClsHnd = call->gtRetClsHnd;
+    Compiler::structPassingKind  howToReturnStruct;
+    var_types                    returnType;
+
+    // There are a couple of Helper Calls that say they return a TYP_STRUCT but they
+    // expect this method to re-type this to a TYP_REF (what is in call->gtReturnType)
+    //
+    //    CORINFO_HELP_METHODDESC_TO_STUBRUNTIMEMETHOD
+    //    CORINFO_HELP_FIELDDESC_TO_STUBRUNTIMEFIELD
+    //    CORINFO_HELP_TYPEHANDLE_TO_RUNTIMETYPE_MAYBENULL
+    //
+    if (isHelperCall)
     {
-#ifdef FEATURE_HFA
-        if (call->gtCall.IsVarargs() || !IsHfa(call))
-#endif 
-        {
-            // Now that we are past the importer, re-type this node so the register predictor does
-            // the right thing
-            call->gtType = genActualType((var_types)call->gtCall.gtReturnType);
-        }
+        assert(!callHasRetBuffArg);
+        assert(retClsHnd == NO_CLASS_HANDLE);
+
+        // Now that we are past the importer, re-type this node 
+        howToReturnStruct = SPK_PrimitiveType;
+        returnType = (var_types)call->gtReturnType;
+    }
+    else
+    {
+        returnType = getReturnTypeForStruct(retClsHnd, &howToReturnStruct);
     }
 
-#ifdef FEATURE_HFA
-    // Either we don't have a struct now or if struct, then it is HFA returned in regs.
-    assert(!varTypeIsStruct(call) || (IsHfa(call) && !callHasRetBuffArg));
-#elif defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+    if (howToReturnStruct == SPK_ByReference)
+    {
+        assert(returnType == TYP_UNKNOWN);
+        assert(callHasRetBuffArg);
+    }
+    else
+    {
+        assert(returnType != TYP_UNKNOWN);
+
+        if (returnType != TYP_STRUCT)
+        {
+            // Widen the primitive type if necessary
+            returnType = genActualType(returnType);
+        }
+        call->gtType = returnType;
+    }
+
+#if FEATURE_MULTIREG_RET
     // Either we don't have a struct now or if struct, then it is a struct returned in regs or in return buffer.
     assert(!varTypeIsStruct(call) || call->HasMultiRegRetVal() || callHasRetBuffArg);
-#else 
+#else // !FEATURE_MULTIREG_RET
     // No more struct returns
     assert(call->TypeGet() != TYP_STRUCT);
 #endif
@@ -5402,7 +5626,7 @@ GenTreePtr          Compiler::fgMorphArrayIndex(GenTreePtr tree)
     addr = gtNewOperNode(GT_ADD, TYP_BYREF, addr, cns);
 
 #if SMALL_TREE_NODES
-    assert(tree->gtFlags & GTF_NODE_LARGE);
+    assert(tree->gtDebugFlags & GTF_DEBUG_NODE_LARGE);
 #endif
 
     // Change the orginal GT_INDEX node into a GT_IND node
@@ -5485,7 +5709,7 @@ GenTreePtr          Compiler::fgMorphArrayIndex(GenTreePtr tree)
         }
     }
 
-    assert(!fgGlobalMorph || (arrElem->gtFlags & GTF_MORPHED));
+    assert(!fgGlobalMorph || (arrElem->gtDebugFlags & GTF_DEBUG_NODE_MORPHED));
 
     addr = arrElem->gtOp.gtOp1;
 
@@ -5878,13 +6102,14 @@ GenTreePtr          Compiler::fgMorphField(GenTreePtr tree, MorphAddrContext* ma
                 lclNum = objRef->gtLclVarCommon.gtLclNum;
             }
 
-            // Create the "nullchk" node
-            nullchk = gtNewOperNode(GT_NULLCHECK,
-                                    TYP_BYTE,  // Make it TYP_BYTE so we only deference it for 1 byte.
-                                    gtNewLclvNode(lclNum, objRefType));
+            // Create the "nullchk" node.
+            // Make it TYP_BYTE so we only deference it for 1 byte.
+            GenTreePtr lclVar = gtNewLclvNode(lclNum, objRefType);
+            nullchk = new(this, GT_NULLCHECK) GenTreeIndir(GT_NULLCHECK, TYP_BYTE, lclVar, nullptr);
+                                    
             nullchk->gtFlags |= GTF_DONT_CSE;     // Don't try to create a CSE for these TYP_BYTE indirections
 
-            /* An indirection will cause a GPF if the address is null */
+            // An indirection will cause a GPF if the address is null.
             nullchk->gtFlags |= GTF_EXCEPT;
 
             if (asg)
@@ -6389,12 +6614,15 @@ bool                Compiler::fgCanFastTailCall(GenTreeCall* callee)
             }
 
             // Get the size of the struct and see if it is register passable.
+            CORINFO_CLASS_HANDLE objClass = nullptr;
+
             if (argx->OperGet() == GT_OBJ)
             {
+                objClass = argx->AsObj()->gtClass;
 #if defined(_TARGET_AMD64_) || defined(_TARGET_ARM64_)
 
                 unsigned typeSize = 0;
-                hasMultiByteArgs = !VarTypeIsMultiByteAndCanEnreg(argx->TypeGet(), argx->gtObj.gtClass, &typeSize, false);
+                hasMultiByteArgs = !VarTypeIsMultiByteAndCanEnreg(argx->TypeGet(), objClass, &typeSize, false);
 
 #if defined(FEATURE_UNIX_AMD64_STRUCT_PASSING) || defined(_TARGET_ARM64_)
                 // On System V/arm64 the args could be a 2 eightbyte struct that is passed in two registers.
@@ -6456,10 +6684,10 @@ bool                Compiler::fgCanFastTailCall(GenTreeCall* callee)
  */
 void                Compiler::fgMorphTailCall(GenTreeCall* call)
 {
-    // x86 classic codegen doesn't require any morphing
-#if defined(_TARGET_X86_) && !defined(LEGACY_BACKEND)
-    NYI_X86("Tail call morphing");
-#elif defined(_TARGET_ARM_)
+    JITDUMP("fgMorphTailCall (before):\n");
+    DISPTREE(call);
+
+#if defined(_TARGET_ARM_)
     // For the helper-assisted tail calls, we need to push all the arguments
     // into a single list, and then add a few extra at the beginning
 
@@ -6506,13 +6734,7 @@ void                Compiler::fgMorphTailCall(GenTreeCall* call)
             call->gtFlags &= ~GTF_CALL_NULLCHECK;
         }
 
-        GenTreeArgList** pList = &call->gtCallArgs;
-#if RETBUFARG_PRECEDES_THIS
-        if (call->HasRetBufArg()) {
-           pList = &(*pList)->Rest();
-        }
-#endif // RETBUFARG_PRECEDES_THIS
-        *pList = gtNewListNode(objp, *pList);
+        call->gtCallArgs = gtNewListNode(objp, call->gtCallArgs);
     }
 
     // Add the extra VSD parameter if needed
@@ -6593,14 +6815,47 @@ void                Compiler::fgMorphTailCall(GenTreeCall* call)
     call->gtCallMoreFlags = GTF_CALL_M_VARARGS | GTF_CALL_M_TAILCALL;
     call->gtFlags &= ~GTF_CALL_POP_ARGS;
 
-#elif defined(_TARGET_AMD64_)
+#elif defined(_TARGET_XARCH_) && !defined(LEGACY_BACKEND)
+
+    // x86 classic codegen doesn't require any morphing
+
     // For the helper-assisted tail calls, we need to push all the arguments
-    // into a single list, and then add a few extra at the beginning.
+    // into a single list, and then add a few extra at the beginning or end.
     //
-    // TailCallHelper(void *copyRoutine, void *callTarget, ....) - i.e We need to add
-    // copyRoutine and callTarget extra params at the beginning.  But callTarget is
-    // determined by Lower phase.  Therefore, we add a place holder arg for callTarget
-    // here which will be later replaced with callTarget in tail call lowering.
+    // For AMD64, the tailcall helper (JIT_TailCall) is defined as:
+    //
+    //      JIT_TailCall(void* copyRoutine, void* callTarget, <function args>)
+    //
+    // We need to add "copyRoutine" and "callTarget" extra params at the beginning.
+    // But callTarget is determined by the Lower phase. Therefore, we add a placeholder arg
+    // for callTarget here which will be replaced later with callTarget in tail call lowering.
+    //
+    // For x86, the tailcall helper is defined as:
+    //
+    //      JIT_TailCall(<function args>, int numberOfOldStackArgsWords, int numberOfNewStackArgsWords, int flags, void* callTarget)
+    //
+    // Note that the special arguments are on the stack, whereas the function arguments follow
+    // the normal convention: there might be register arguments in ECX and EDX. The stack will
+    // look like (highest address at the top):
+    //      first normal stack argument
+    //      ...
+    //      last normal stack argument
+    //      numberOfOldStackArgs
+    //      numberOfNewStackArgs
+    //      flags
+    //      callTarget
+    //
+    // Each special arg is 4 bytes.
+    //
+    // 'flags' is a bitmask where:
+    //      1 == restore callee-save registers (EDI,ESI,EBX). The JIT always saves all
+    //          callee-saved registers for tailcall functions. Note that the helper assumes
+    //          that the callee-saved registers live immediately below EBP, and must have been
+    //          pushed in this order: EDI, ESI, EBX.
+    //      2 == call target is a virtual stub dispatch.
+    //
+    // The x86 tail call helper lives in VM\i386\jithelp.asm. See that function for more details
+    // on the custom calling convention.
 
     // Check for PInvoke call types that we don't handle in codegen yet.
     assert(!call->IsUnmanaged());
@@ -6616,17 +6871,56 @@ void                Compiler::fgMorphTailCall(GenTreeCall* call)
     assert(!call->IsImplicitTailCall());
     assert(!fgCanFastTailCall(call));
 
-     // First move the this pointer (if any) onto the regular arg list    
+    // First move the 'this' pointer (if any) onto the regular arg list. We do this because
+    // we are going to prepend special arguments onto the argument list (for non-x86 platforms),
+    // and thus shift where the 'this' pointer will be passed to a later argument slot. In
+    // addition, for all platforms, we are going to change the call into a helper call. Our code
+    // generation code for handling calls to helpers does not handle 'this' pointers. So, when we
+    // do this transformation, we must explicitly create a null 'this' pointer check, if required,
+    // since special 'this' pointer handling will no longer kick in.
+    //
+    // Some call types, such as virtual vtable calls, require creating a call address expression
+    // that involves the "this" pointer. Lowering will sometimes create an embedded statement
+    // to create a temporary that is assigned to the "this" pointer expression, and then use
+    // that temp to create the call address expression. This temp creation embedded statement
+    // will occur immediately before the "this" pointer argument, and then will be used for both
+    // the "this" pointer argument as well as the call address expression. In the normal ordering,
+    // the embedded statement establishing the "this" pointer temp will execute before both uses
+    // of the temp. However, for tail calls via a helper, we move the "this" pointer onto the
+    // normal call argument list, and insert a placeholder which will hold the call address
+    // expression. For non-x86, things are ok, because the order of execution of these is not
+    // altered. However, for x86, the call address expression is inserted as the *last* argument
+    // in the argument list, *after* the "this" pointer. It will be put on the stack, and be
+    // evaluated first. To ensure we don't end up with out-of-order temp definition and use,
+    // for those cases where call lowering creates an embedded form temp of "this", we will
+    // create a temp here, early, that will later get morphed correctly.
+
     if (call->gtCallObjp)
     {
         GenTreePtr thisPtr = nullptr;
         GenTreePtr objp = call->gtCallObjp;
         call->gtCallObjp = nullptr;
 
+#ifdef _TARGET_X86_
+        if ((call->IsDelegateInvoke() || call->IsVirtualVtable()) && !objp->IsLocal())
+        {
+            // tmp = "this"            
+            unsigned lclNum = lvaGrabTemp(true DEBUGARG("tail call thisptr"));
+            GenTreePtr asg  = gtNewTempAssign(lclNum, objp);
+                
+            // COMMA(tmp = "this", tmp)
+            var_types vt = objp->TypeGet();
+            GenTreePtr tmp = gtNewLclvNode(lclNum, vt);
+            thisPtr = gtNewOperNode(GT_COMMA, vt, asg, tmp);
+
+            objp = thisPtr;
+        }
+#endif // _TARGET_X86_
+
         if (call->NeedsNullCheck())
-        {            
+        {
             // clone "this" if "this" has no side effects.
-            if (!(objp->gtFlags & GTF_SIDE_EFFECT))
+            if ((thisPtr == nullptr) && !(objp->gtFlags & GTF_SIDE_EFFECT))
             {                
                 thisPtr = gtClone(objp, true);
             }
@@ -6662,18 +6956,13 @@ void                Compiler::fgMorphTailCall(GenTreeCall* call)
             thisPtr = objp;
         }
 
-        GenTreeArgList** pList = &call->gtCallArgs;
-#if RETBUFARG_PRECEDES_THIS
-        if (call->HasRetBufArg()) {
-           pList = &(*pList)->Rest();
-        }
-#endif // RETBUFARG_PRECEDES_THIS
-
         // During rationalization tmp="this" and null check will
         // materialize as embedded stmts in right execution order.
         assert(thisPtr != nullptr);
-        *pList = gtNewListNode(thisPtr, *pList);
+        call->gtCallArgs = gtNewListNode(thisPtr, call->gtCallArgs);
     }
+
+#if defined(_TARGET_AMD64_)
 
     // Add the extra VSD parameter to arg list in case of VSD calls.
     // Tail call arg copying thunk will move this extra VSD parameter
@@ -6713,12 +7002,50 @@ void                Compiler::fgMorphTailCall(GenTreeCall* call)
     arg = gtNewIconHandleNode(ssize_t(pfnCopyArgs), GTF_ICON_FTN_ADDR);
     call->gtCallArgs = gtNewListNode(arg, call->gtCallArgs);
 
+#else // !_TARGET_AMD64_
+
+    // Find the end of the argument list. ppArg will point at the last pointer; setting *ppArg will
+    // append to the list.
+    GenTreeArgList** ppArg = &call->gtCallArgs;
+    for (GenTreeArgList* args = call->gtCallArgs; args != nullptr; args = args->Rest())
+    {
+        ppArg = (GenTreeArgList**)&args->gtOp2;
+    }
+    assert(ppArg != nullptr);
+    assert(*ppArg == nullptr);
+
+    unsigned nOldStkArgsWords = (compArgSize - (codeGen->intRegState.rsCalleeRegArgCount * REGSIZE_BYTES)) / REGSIZE_BYTES;
+    GenTree* arg3 = gtNewIconNode((ssize_t)nOldStkArgsWords, TYP_I_IMPL);
+    *ppArg = gtNewListNode(arg3, nullptr); // numberOfOldStackArgs
+    ppArg = (GenTreeArgList**)&((*ppArg)->gtOp2);
+
+    // Inject a placeholder for the count of outgoing stack arguments that the Lowering phase will generate.
+    // The constant will be replaced.
+    GenTree* arg2 = gtNewIconNode(9, TYP_I_IMPL);
+    *ppArg = gtNewListNode(arg2, nullptr); // numberOfNewStackArgs
+    ppArg = (GenTreeArgList**)&((*ppArg)->gtOp2);
+
+    // Inject a placeholder for the flags.
+    // The constant will be replaced.
+    GenTree* arg1 = gtNewIconNode(8, TYP_I_IMPL);
+    *ppArg = gtNewListNode(arg1, nullptr);
+    ppArg = (GenTreeArgList**)&((*ppArg)->gtOp2);
+
+    // Inject a placeholder for the real call target that the Lowering phase will generate.
+    // The constant will be replaced.
+    GenTree* arg0 = gtNewIconNode(7, TYP_I_IMPL);
+    *ppArg = gtNewListNode(arg0, nullptr);
+
+#endif // !_TARGET_AMD64_
+
     // It is now a varargs tail call dispatched via helper.
     call->gtCallMoreFlags |= GTF_CALL_M_VARARGS | GTF_CALL_M_TAILCALL | GTF_CALL_M_TAILCALL_VIA_HELPER;
     call->gtFlags &= ~GTF_CALL_POP_ARGS;
 
-#endif  //_TARGET_AMD64_
+#endif // _TARGET_*
 
+    JITDUMP("fgMorphTailCall (after):\n");
+    DISPTREE(call);
 }
 
 //------------------------------------------------------------------------------
@@ -7081,7 +7408,10 @@ GenTreePtr          Compiler::fgMorphCall(GenTreeCall* call)
         }
 #endif // FEATURE_TAILCALL_OPT
 
-        fgFixupStructReturn(call);
+        if (varTypeIsStruct(call))
+        {
+            fgFixupStructReturn(call);
+        }
 
         var_types   callType = call->TypeGet();
 
@@ -7120,7 +7450,7 @@ GenTreePtr          Compiler::fgMorphCall(GenTreeCall* call)
                     szFailReason = "Opportunistic tail call cannot be dispatched as epilog+jmp";
                 }
 #ifndef LEGACY_BACKEND
-                else if (!call->IsVirtualStub() && call->HasNonStandardArgs())
+                else if (!call->IsVirtualStub() && call->HasNonStandardAddedArgs(this))
                 {
                     // If we are here, it means that the call is an explicitly ".tail" prefixed and cannot be
                     // dispatched as a fast tail call.
@@ -7130,7 +7460,7 @@ GenTreePtr          Compiler::fgMorphCall(GenTreeCall* call)
                     // tail calling the target method and hence ".tail" prefix on such calls needs to be
                     // ignored.
                     //
-                    // Exception to the above rule: although Virtual Stub Dispatch (VSD) calls though require
+                    // Exception to the above rule: although Virtual Stub Dispatch (VSD) calls require
                     // extra stub param (e.g. in R11 on Amd64), they can still be called via tail call helper. 
                     // This is done by by adding stubAddr as an additional arg before the original list of 
                     // args. For more details see fgMorphTailCall() and CreateTailCallCopyArgsThunk()
@@ -7606,8 +7936,6 @@ NO_TAIL_CALL:
 
     /* Process the "normal" argument list */
     call = fgMorphArgs(call);
-
-    // Optimize get_ManagedThreadId(get_CurrentThread)
     noway_assert(call->gtOper == GT_CALL);
 
     // Morph stelem.ref helper call to store a null value, into a store into an array without the helper.
@@ -7642,6 +7970,7 @@ NO_TAIL_CALL:
         }
     }
 
+    // Optimize get_ManagedThreadId(get_CurrentThread)
     if ((call->gtCallMoreFlags & GTF_CALL_M_SPECIAL_INTRINSIC) &&
            info.compCompHnd->getIntrinsicID(call->gtCallMethHnd) == CORINFO_INTRINSIC_GetManagedThreadId)
     {
@@ -7681,7 +8010,7 @@ NO_TAIL_CALL:
         copyBlk = fgMorphTree(copyBlk);
         GenTree* result = gtNewOperNode(GT_COMMA, TYP_VOID, call, copyBlk);
 #ifdef DEBUG
-        result->gtFlags |= GTF_MORPHED;
+        result->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
         return result;
     }
@@ -8107,29 +8436,9 @@ _DoneSrc:;
         }
         else // (oper == GT_INITBLK)
         {
-            if (size > 1)
-            {
-                size_t cns = src->gtIntCon.gtIconVal;
-                cns  = cns & 0xFF;
-                cns |= cns << 8;
-                if (size >= 4)
-                {
-                    cns |= cns << 16;
-#ifdef _TARGET_64BIT_
-                    if (size == 8)
-                    {
-                        cns |= cns << 32;
-                    }
-#endif // _TARGET_64BIT_
-
-                    src->gtType = type;   // Make the type used in the GT_IND node match for TYP_REF
-
-                    // if we are using an GT_INITBLK on a GC type the value being assigned has to be zero (null)
-                    assert(!varTypeIsGC(type) || (cns == 0));
-                }
-
-                src->gtIntCon.gtIconVal = cns;
-            }
+            // This will mutate the integer constant, in place, to be the correct
+            // value for the type were are using in the assignment.
+            src->AsIntCon()->FixupInitBlkValue(type);
         }
 
         /* Create the assignment node */
@@ -8360,7 +8669,7 @@ GenTreePtr          Compiler::fgMorphInitBlock(GenTreePtr tree)
     }
 
 #ifdef DEBUG
-    tree->gtFlags |= GTF_MORPHED;
+    tree->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 
     if (verbose)
     {
@@ -8992,7 +9301,7 @@ GenTreePtr          Compiler::fgMorphCopyBlock(GenTreePtr tree)
     }
 
 #ifdef DEBUG
-    tree->gtFlags |= GTF_MORPHED;
+    tree->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 
     if (verbose)
     {
@@ -9243,7 +9552,7 @@ GenTreePtr Compiler::fgMorphFieldToSIMDIntrinsicGet(GenTreePtr tree)
         GenTree* op2 = gtNewIconNode(index);   
         tree =  gtNewSIMDNode(baseType, simdStructNode, op2, SIMDIntrinsicGetItem, baseType, simdSize); 
 #ifdef DEBUG
-        tree->gtFlags |= GTF_MORPHED;
+        tree->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
     }
     return tree;
@@ -9292,7 +9601,7 @@ GenTreePtr  Compiler::fgMorphFieldAssignToSIMDIntrinsicSet(GenTreePtr tree)
             simdIntrinsicID = SIMDIntrinsicSetW;
             break;
         default:
-            noway_assert("There is no set intrinsic for index bigger than 3");
+            noway_assert(!"There is no set intrinsic for index bigger than 3");
         }
         
 
@@ -9306,7 +9615,7 @@ GenTreePtr  Compiler::fgMorphFieldAssignToSIMDIntrinsicSet(GenTreePtr tree)
                             gtNewIconNode(simdSize),
                             false);
 #ifdef DEBUG
-        tree->gtFlags |= GTF_MORPHED;
+        tree->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
     }
     
@@ -9725,7 +10034,7 @@ NO_MUL_64RSLT:
             {
                 GenTreePtr zeroNode = gtNewZeroConNode(typ);
 #ifdef DEBUG
-                zeroNode->gtFlags |= GTF_MORPHED;
+                zeroNode->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
                 DEBUG_DESTROY_NODE(tree);
                 return zeroNode;
@@ -11676,7 +11985,7 @@ CM_ADD_OP:
             commaNode->gtType = typ;
             commaNode->gtFlags = (treeFlags & ~GTF_REVERSE_OPS); // Bashing the GT_COMMA flags here is dangerous, clear the GTF_REVERSE_OPS at least.
 #ifdef DEBUG
-            commaNode->gtFlags |= GTF_MORPHED;
+            commaNode->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
             while (commaNode->gtOp.gtOp2->gtOper == GT_COMMA)
             {
@@ -11684,7 +11993,7 @@ CM_ADD_OP:
                 commaNode->gtType = typ;
                 commaNode->gtFlags = (treeFlags & ~GTF_REVERSE_OPS); // Bashing the GT_COMMA flags here is dangerous, clear the GTF_REVERSE_OPS at least.
 #ifdef DEBUG
-                commaNode->gtFlags |= GTF_MORPHED;
+                commaNode->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
             }
             bool wasArrIndex = (tree->gtFlags & GTF_IND_ARR_INDEX) != 0;
@@ -11703,7 +12012,7 @@ CM_ADD_OP:
                 GetArrayInfoMap()->Set(op1, arrInfo);
             }
 #ifdef DEBUG
-            op1->gtFlags |= GTF_MORPHED;
+            op1->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
             commaNode->gtOp.gtOp2 = op1;
             return tree;
@@ -11786,7 +12095,7 @@ CM_ADD_OP:
             {
                 commaNode->gtType = op1->gtType; commaNode->gtFlags |= op1->gtFlags;
 #ifdef DEBUG
-                commaNode->gtFlags |= GTF_MORPHED;
+                commaNode->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
                 commaNode = commaNode->gtOp.gtOp2;
             }
@@ -12748,7 +13057,7 @@ bool Compiler::fgShouldUseMagicNumberDivide(GenTreeOp* tree)
         return false;
 
     // codegen will expand these
-    if (isPow2(cons))
+    if (cons == SSIZE_T_MIN || isPow2(abs(cons)))
         return false;
 
     // someone else will fold this away, so don't make it complicated for them
@@ -12784,7 +13093,7 @@ GenTree* Compiler::fgMorphModByConst(GenTreeOp* tree)
     GenTree* sub = gtNewOperNode(GT_SUB, type, numerator, mul);
 
 #ifdef DEBUG
-    sub->gtFlags |= GTF_MORPHED;
+    sub->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
 
     return sub;
@@ -12838,7 +13147,7 @@ GenTree* Compiler::fgMorphModToSubMulDiv(GenTreeOp* tree)
     GenTree* sub = gtNewOperNode(GT_SUB, type, gtCloneExpr(numerator), mul);
 
 #ifdef DEBUG
-    sub->gtFlags |= GTF_MORPHED;
+    sub->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
 
     return sub;
@@ -12924,7 +13233,7 @@ GenTree* Compiler::fgMorphDivByConst(GenTreeOp* tree)
     DISPTREE(result);
 
 #ifdef DEBUG
-    result->gtFlags |= GTF_MORPHED;
+    result->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
 
     return result;
@@ -13442,7 +13751,7 @@ GenTreePtr          Compiler::fgMorphTree(GenTreePtr tree, MorphAddrContext* mac
     if (fgGlobalMorph)
     {
         /* Ensure that we haven't morphed this node already */
-        assert(((tree->gtFlags & GTF_MORPHED) == 0) && "ERROR: Already morphed this node!");
+        assert(((tree->gtDebugFlags & GTF_DEBUG_NODE_MORPHED) == 0) && "ERROR: Already morphed this node!");
 
 #if LOCAL_ASSERTION_PROP
         /* Before morphing the tree, we try to propagate any active assertions */
@@ -13648,7 +13957,7 @@ void                Compiler::fgKillDependentAssertions(unsigned lclNum
  *
  *  This function is called to complete the morphing of a tree node
  *  It should only be called once for each node.
- *  If DEBUG is defined the flag GTF_MORPHED is checked and updated,
+ *  If DEBUG is defined the flag GTF_DEBUG_NODE_MORPHED is checked and updated,
  *  to enforce the invariant that each node is only morphed once.
  *  If LOCAL_ASSERTION_PROP is enabled the result tree may be replaced
  *  by an equivalent tree.
@@ -13674,7 +13983,7 @@ void                Compiler::fgMorphTreeDone(GenTreePtr tree,
     if ((oldTree != NULL) && (oldTree != tree))
     {
         /* Ensure that we have morphed this node */
-        assert((tree->gtFlags & GTF_MORPHED) && "ERROR: Did not morph this node!");
+        assert((tree->gtDebugFlags & GTF_DEBUG_NODE_MORPHED) && "ERROR: Did not morph this node!");
 
 #ifdef DEBUG
         TransferTestDataToNode(oldTree, tree);
@@ -13683,7 +13992,7 @@ void                Compiler::fgMorphTreeDone(GenTreePtr tree,
     else
     {
         // Ensure that we haven't morphed this node already 
-        assert(((tree->gtFlags & GTF_MORPHED) == 0) && "ERROR: Already morphed this node!");
+        assert(((tree->gtDebugFlags & GTF_DEBUG_NODE_MORPHED) == 0) && "ERROR: Already morphed this node!");
     }
 
     if (tree->OperKind() & GTK_CONST)
@@ -13717,7 +14026,7 @@ DONE:;
 
 #ifdef DEBUG
     /* Mark this node as being morphed */
-    tree->gtFlags |= GTF_MORPHED;
+    tree->gtDebugFlags |= GTF_DEBUG_NODE_MORPHED;
 #endif
 }
 
@@ -14290,7 +14599,7 @@ void                Compiler::fgMorphStmts(BasicBlock * block,
                but the flag still got set, clear it here...  */
 
 #ifdef DEBUG
-            tree->gtFlags &= ~GTF_MORPHED;
+            tree->gtDebugFlags &= ~GTF_DEBUG_NODE_MORPHED;
 #endif
             noway_assert(compTailCallUsed);
             noway_assert((tree->gtOper == GT_CALL) && tree->AsCall()->IsTailCall());
@@ -14717,7 +15026,9 @@ void                Compiler::fgMorphBlocks()
                     noway_assert(ret->gtGetOp1() != nullptr);
                     noway_assert(ret->gtGetOp2() == nullptr);
 
-                    last->gtStmt.gtStmtExpr = gtNewTempAssign(genReturnLocal, ret->gtGetOp1());
+                    GenTreePtr tree = gtNewTempAssign(genReturnLocal, ret->gtGetOp1());
+
+                    last->gtStmt.gtStmtExpr = (tree->OperIsCopyBlkOp()) ? fgMorphCopyBlock(tree) : tree;
 
                     //make sure that copy-prop ignores this assignment.
                     last->gtStmt.gtStmtExpr->gtFlags |= GTF_DONT_CSE;
@@ -15735,11 +16046,15 @@ void                Compiler::fgPromoteStructs()
             tooManyLocals = true;
         }
 #if !FEATURE_MULTIREG_STRUCT_PROMOTE
-        else if (varDsc->lvIsMultiRegArgOrRet)
+        else if (varDsc->lvIsMultiRegArg)
         {
-            JITDUMP("Skipping V%02u: marked lvIsMultiRegArgOrRet.\n", lclNum);
+            JITDUMP("Skipping V%02u: marked lvIsMultiRegArg.\n", lclNum);
         }
 #endif // !FEATURE_MULTIREG_STRUCT_PROMOTE
+        else if (varDsc->lvIsMultiRegRet)
+        {
+            JITDUMP("Skipping V%02u: marked lvIsMultiRegRet.\n", lclNum);
+        }
         else if (varTypeIsStruct(varDsc))
         {
             lvaCanPromoteStructVar(lclNum, &structPromotionInfo);
@@ -15789,11 +16104,11 @@ void                Compiler::fgPromoteStructs()
 #if !FEATURE_MULTIREG_STRUCT_PROMOTE
 #if defined(_TARGET_ARM64_)
                 //
-                // For now we currently don't promote structs that could be passed in registers
+                // For now we currently don't promote structs that are  passed in registers
                 //
-                else if (varDsc->lvIsMultiregStruct())
+                else if (lvaIsMultiregStruct(varDsc))
                 {
-                    JITDUMP("Not promoting promotable struct local V%02u (size==%d): ",
+                    JITDUMP("Not promoting promotable multireg struct local V%02u (size==%d): ",
                             lclNum, lvaLclExactSize(lclNum));
                     shouldPromote = false;
                 }
@@ -15802,8 +16117,8 @@ void                Compiler::fgPromoteStructs()
                 else if (varDsc->lvIsParam)
                 {
 #if FEATURE_MULTIREG_STRUCT_PROMOTE                   
-                    if (varDsc->lvIsMultiregStruct() &&         // Is this a variable holding a value that is passed in multiple registers?
-                        (structPromotionInfo.fieldCnt != 2))    // Does it have exactly two fields
+                    if (lvaIsMultiregStruct(varDsc) &&         // Is this a variable holding a value that is passed in multiple registers?
+                        (structPromotionInfo.fieldCnt != 2))   // Does it have exactly two fields
                     {
                         JITDUMP("Not promoting multireg struct local V%02u, because lvIsParam is true and #fields != 2\n",
                                 lclNum);
@@ -16019,7 +16334,11 @@ Compiler::fgWalkResult      Compiler::fgMorphLocalField(GenTreePtr tree, fgWalkD
             tree->gtLclFld.SetLclNum(fieldLclIndex);
 
             // We need to keep the types 'compatible'.  If we can switch back to a GT_LCL_VAR
+#ifdef ARM_SOFTFP
+            assert(varTypeIsIntegralOrI(tree->TypeGet()) || varTypeIsFloating(tree->TypeGet()));
+#else
             assert(varTypeIsIntegralOrI(tree->TypeGet()));
+#endif
             if (varTypeCanReg(fldVarDsc->TypeGet()))
             {
                 // If the type is integer-ish, then we can use it as-is
@@ -16099,8 +16418,7 @@ void                Compiler::fgMarkImplicitByRefArgs()
 #if defined(_TARGET_AMD64_)
             if (size > REGSIZE_BYTES || (size & (size - 1)) != 0)
 #elif defined(_TARGET_ARM64_)
-            if ((size > TARGET_POINTER_SIZE) && !varDsc->lvIsMultiregStruct())
-
+            if ((size > TARGET_POINTER_SIZE) && !lvaIsMultiregStruct(varDsc))
 #endif
             {
                 // Previously nobody was ever setting lvIsParam and lvIsTemp on the same local
@@ -16143,7 +16461,7 @@ void                Compiler::fgMarkImplicitByRefArgs()
  *  Morph irregular parameters
  *    for x64 and ARM64 this means turning them into byrefs, adding extra indirs.
  */
-bool Compiler::fgMorphImplicitByRefArgs(GenTreePtr tree, fgWalkData* fgWalkPre)
+bool Compiler::fgMorphImplicitByRefArgs(GenTreePtr *pTree, fgWalkData* fgWalkPre)
 {
 #if !defined(_TARGET_AMD64_) && !defined(_TARGET_ARM64_)
 
@@ -16151,6 +16469,7 @@ bool Compiler::fgMorphImplicitByRefArgs(GenTreePtr tree, fgWalkData* fgWalkPre)
 
 #else // _TARGET_AMD64_ || _TARGET_ARM64_
 
+    GenTree* tree = *pTree;
     assert((tree->gtOper == GT_LCL_VAR) ||
            ((tree->gtOper == GT_ADDR) && (tree->gtOp.gtOp1->gtOper == GT_LCL_VAR)));
 
@@ -16177,6 +16496,9 @@ bool Compiler::fgMorphImplicitByRefArgs(GenTreePtr tree, fgWalkData* fgWalkPre)
 
     // We are overloading the lvRefCnt field here because real ref counts have not been set.
     lclVarDsc->lvRefCnt++;
+
+    // This is no longer a def of the lclVar, even if it WAS a def of the struct.
+    lclVarTree->gtFlags &= ~(GTF_LIVENESS_MASK);
 
     if (isAddr)
     {
@@ -16222,6 +16544,7 @@ bool Compiler::fgMorphImplicitByRefArgs(GenTreePtr tree, fgWalkData* fgWalkPre)
 #endif // DEBUG
     }
 
+    *pTree = tree;
     return true;
 
 #endif // _TARGET_AMD64_ || _TARGET_ARM64_
@@ -16423,7 +16746,7 @@ Compiler::fgWalkResult      Compiler::fgMarkAddrTakenLocalsPreCB(GenTreePtr* pTr
         // If we have ADDR(lcl), and "lcl" is an implicit byref parameter, fgMorphImplicitByRefArgs will
         // convert to just "lcl".  This is never an address-context use, since the local is already a
         // byref after this transformation.
-        if (tree->gtOp.gtOp1->OperGet() == GT_LCL_VAR && comp->fgMorphImplicitByRefArgs(tree, fgWalkPre))
+        if (tree->gtOp.gtOp1->OperGet() == GT_LCL_VAR && comp->fgMorphImplicitByRefArgs(pTree, fgWalkPre))
         {
             // Push something to keep the PostCB, which will pop it, happy.
             axcStack->Push(AXC_None);
@@ -16524,7 +16847,7 @@ Compiler::fgWalkResult      Compiler::fgMarkAddrTakenLocalsPreCB(GenTreePtr* pTr
     case GT_LCL_VAR:
         // On some architectures, some arguments are passed implicitly by reference.
         // Modify the trees to reflect that, if this local is one of those.
-        if (comp->fgMorphImplicitByRefArgs(tree, fgWalkPre))
+        if (comp->fgMorphImplicitByRefArgs(pTree, fgWalkPre))
         {
             // We can't be in an address context; the ADDR(lcl), where lcl is an implicit byref param, was
             // handled earlier.  (And we can't have added anything to this address, since it was implicit.)

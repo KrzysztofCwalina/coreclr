@@ -87,7 +87,12 @@ Compiler::CSEdsc   *   Compiler::optCSEfindDsc(unsigned index)
 
 void                Compiler::optUnmarkCSE(GenTreePtr tree)
 {
-    noway_assert(IS_CSE_INDEX(tree->gtCSEnum));
+    if (!IS_CSE_INDEX(tree->gtCSEnum))
+    {
+        // This tree is not a CSE candidate, so there is nothing
+        // to do.
+        return;
+    }
 
     unsigned CSEnum = GET_CSE_INDEX(tree->gtCSEnum);
     CSEdsc * desc;
@@ -230,7 +235,6 @@ Compiler::fgWalkResult      Compiler::optUnmarkCSEs(GenTreePtr *pTree, fgWalkDat
             if (tree == op1)
             {
                 // This tree and all of its sub trees are being kept 
-                // so we skip marking with GTF_DEAD, etc...
                 return WALK_SKIP_SUBTREES;
             }
 
@@ -242,20 +246,14 @@ Compiler::fgWalkResult      Compiler::optUnmarkCSEs(GenTreePtr *pTree, fgWalkDat
         if (tree == keptTree)
         {
             // This tree and all of its sub trees are being kept 
-            // so we skip marking with GTF_DEAD, etc...
             return WALK_SKIP_SUBTREES;
         }
     }
 
     // This node is being removed from the graph of GenTreePtr
-    // Mark with GTF_DEAD, call optUnmarkCSE and 
-    // decrement the LclVar ref counts.
-    //
-    assert((tree->gtFlags & GTF_DEAD) == 0);
-    tree->gtFlags |= GTF_DEAD;
-
-    if  (IS_CSE_INDEX(tree->gtCSEnum))
-        comp->optUnmarkCSE(tree);
+    // Call optUnmarkCSE and  decrement the LclVar ref counts.
+    comp->optUnmarkCSE(tree);
+    assert(!IS_CSE_INDEX(tree->gtCSEnum));
 
     /* Look for any local variable references */
 
@@ -315,17 +313,24 @@ void                Compiler::optCSE_GetMaskData(GenTreePtr tree, optCSE_MaskDat
 }
 
 
-// Given a binary tree node return true if it is safe to swap the order of evaluation for op1 and op2
-// It only considers the locations of the CSE defs and uses for op1 and op2 to decide this
+//------------------------------------------------------------------------
+// optCSE_canSwap: Determine if the execution order of two nodes can be swapped.
 //
-bool                Compiler::optCSE_canSwap(GenTreePtr tree)
+// Arguments:
+//    op1 - The first node
+//    op2 - The second node
+//
+// Return Value:
+//    Return true iff it safe to swap the execution order of 'op1' and 'op2',
+//    considering only the locations of the CSE defs and uses.
+//
+// Assumptions:
+//    'op1' currently occurse before 'op2' in the execution order.
+//
+bool                Compiler::optCSE_canSwap(GenTree* op1, GenTree* op2)
 {
-    assert((tree->OperKind() & GTK_SMPOP) != 0);
-
-    GenTreePtr      op1 = tree->gtOp.gtOp1;
-    GenTreePtr      op2 = tree->gtGetOp2();
-
-    assert(op1 != nullptr);  // We must have a binary treenode with non-null op1 and op2
+    // op1 and op2 must be non-null.
+    assert(op1 != nullptr);
     assert(op2 != nullptr);
 
     bool canSwap = true;   // the default result unless proven otherwise.
@@ -343,7 +348,7 @@ bool                Compiler::optCSE_canSwap(GenTreePtr tree)
     }
     else
     {
-        // We also cannot swap if op2 contains a CSE def that is used by op1
+        // We also cannot swap if op2 contains a CSE def that is used by op1.
         if ((op2MaskData.CSE_defMask & op1MaskData.CSE_useMask) != 0)
         {
             canSwap = false;
@@ -353,6 +358,26 @@ bool                Compiler::optCSE_canSwap(GenTreePtr tree)
     return canSwap;
 }
 
+//------------------------------------------------------------------------
+// optCSE_canSwap: Determine if the execution order of a node's operands can be swapped.
+//
+// Arguments:
+//    tree - The node of interest
+//
+// Return Value:
+//    Return true iff it safe to swap the execution order of the operands of 'tree',
+//    considering only the locations of the CSE defs and uses.
+//
+bool                Compiler::optCSE_canSwap(GenTreePtr tree)
+{
+    // We must have a binary treenode with non-null op1 and op2
+    assert((tree->OperKind() & GTK_SMPOP) != 0);
+
+    GenTreePtr      op1 = tree->gtOp.gtOp1;
+    GenTreePtr      op2 = tree->gtGetOp2();
+
+    return optCSE_canSwap(op1, op2);
+}
 
 /*****************************************************************************
  *
@@ -407,19 +432,19 @@ int __cdecl         Compiler::optCSEcostCmpSz(const void *op1, const void *op2)
 
     int diff;
 
-    diff = (int)(exp2->gtCostEx - exp1->gtCostEx);
+    diff = (int)(exp2->gtCostSz - exp1->gtCostSz);
 
     if (diff != 0)
         return diff;
 
     // Sort the higher Use Counts toward the top
-    diff = (int)(dsc2->csdUseWtCnt - dsc1->csdUseWtCnt);
+    diff = (int)(dsc2->csdUseCount - dsc1->csdUseCount);
 
     if (diff != 0)
         return diff;
 
     // With the same use count, Sort the lower Def Counts toward the top
-    diff = (int)(dsc1->csdDefWtCnt - dsc2->csdDefWtCnt);
+    diff = (int)(dsc1->csdDefCount - dsc2->csdDefCount);
 
     if (diff != 0)
         return diff;
@@ -1713,13 +1738,8 @@ public:
             // Assert if we used DEBUG_DESTROY_NODE on this CSE exp 
             assert(exp->gtOper != GT_COUNT);
                 
-            /* Ignore the node if it's part of a removed CSE */
-            if  (exp->gtFlags & GTF_DEAD)
-                continue;
-                
             /* Ignore the node if it's not been marked as a CSE */
-                
-            if  (!IS_CSE_INDEX(exp->gtCSEnum))
+            if (!IS_CSE_INDEX(exp->gtCSEnum))
                 continue;
                 
             /* Make sure we update the weighted ref count correctly */
@@ -1766,7 +1786,7 @@ public:
                 cse = m_pCompiler->gtNewLclvNode(cseLclVarNum, cseLclVarTyp);
                 cse->gtVNPair = exp->gtVNPair;  // assign the proper Value Numbers 
 #ifdef DEBUG
-                cse->gtFlags |= GTFD_VAR_CSE_REF;
+                cse->gtDebugFlags |= GTF_DEBUG_VAR_CSE_REF;
 #endif // DEBUG
 
                 // If we have side effects then we need to create a GT_COMMA tree instead

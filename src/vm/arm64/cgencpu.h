@@ -54,8 +54,8 @@ class ComCallMethodDesc;
 #define CACHE_LINE_SIZE                         32  // As per Intel Optimization Manual the cache line size is 32 bytes
 #define LOG2SLOT                                LOG2_PTRSIZE
 
-#define ENREGISTERED_RETURNTYPE_MAXSIZE         64  // bytes (maximum HFA size is 8 doubles)
-#define ENREGISTERED_RETURNTYPE_INTEGER_MAXSIZE 8   // bytes
+#define ENREGISTERED_RETURNTYPE_MAXSIZE         32  // bytes (four FP registers: d0,d1,d2 and d3)
+#define ENREGISTERED_RETURNTYPE_INTEGER_MAXSIZE 16  // bytes (two int registers: x0 and x1)
 #define ENREGISTERED_PARAMTYPE_MAXSIZE          16  // bytes (max value type size that can be passed by value)
 
 #define CALLDESCR_ARGREGS                       1   // CallDescrWorker has ArgumentRegister parameter
@@ -109,9 +109,9 @@ struct CalleeSavedRegisters {
 //--------------------------------------------------------------------
 typedef DPTR(struct ArgumentRegisters) PTR_ArgumentRegisters;
 struct ArgumentRegisters {
-    INT64 x[8]; // x0 ....x7
+    INT64 x[9]; // x0 ....x7 & x8 can contain return buffer address
 };
-#define NUM_ARGUMENT_REGISTERS 8
+#define NUM_ARGUMENT_REGISTERS 9
 
 #define ARGUMENTREGISTERS_SIZE sizeof(ArgumentRegisters)
 
@@ -153,9 +153,34 @@ inline TADDR GetSP(const T_CONTEXT * context) {
     return TADDR(context->Sp);
 }
 
-inline PCODE GetLR(const T_CONTEXT * context) {
+inline TADDR GetLR(const T_CONTEXT * context) {
     LIMITED_METHOD_DAC_CONTRACT;
-    return PCODE(context->Lr);
+    return context->Lr;
+}
+
+inline void SetLR( T_CONTEXT * context, TADDR eip) {
+    LIMITED_METHOD_DAC_CONTRACT;
+    context->Lr = eip;
+}
+
+inline TADDR GetReg(T_CONTEXT * context, int Regnum)
+{
+    LIMITED_METHOD_DAC_CONTRACT;
+    _ASSERTE(Regnum >= 0 && Regnum < 32 );
+     return context->X[Regnum];
+}
+
+inline void SetReg(T_CONTEXT * context,  int Regnum, PCODE RegContent)
+{
+    LIMITED_METHOD_DAC_CONTRACT;
+    _ASSERTE(Regnum >= 0 && Regnum <=28 );
+    context->X[Regnum] = RegContent;
+}
+inline void SetSimdReg(T_CONTEXT * context, int Regnum, NEON128 RegContent)
+{
+    LIMITED_METHOD_DAC_CONTRACT;
+    _ASSERTE(Regnum >= 0 && Regnum <= 28);
+    context->V[Regnum] = RegContent;
 }
 
 extern "C" LPVOID __stdcall GetCurrentSP();
@@ -175,6 +200,40 @@ inline TADDR GetFP(const T_CONTEXT * context)
     LIMITED_METHOD_DAC_CONTRACT;
     return (TADDR)(context->Fp);
 }
+
+inline NEON128 GetSimdMem(PCODE ip)
+{
+    NEON128 mem;
+    LIMITED_METHOD_DAC_CONTRACT;
+    EX_TRY
+    {
+        mem.Low  = dac_cast<PCODE>(ip);
+        mem.High = dac_cast<PCODE>(ip + sizeof(PCODE));
+    }
+    EX_CATCH
+    {
+        _ASSERTE(!"Memory read within jitted Code Failed, this should not happen!!!!");
+    }
+    EX_END_CATCH(SwallowAllExceptions);
+
+    return mem;
+}
+inline TADDR GetMem(PCODE ip)
+{
+    TADDR mem;
+    LIMITED_METHOD_DAC_CONTRACT;
+    EX_TRY
+    {
+        mem = dac_cast<TADDR>(ip);
+    }
+    EX_CATCH
+    {
+        _ASSERTE(!"Memory read within jitted Code Failed, this should not happen!!!!");
+    }
+    EX_END_CATCH(SwallowAllExceptions);
+    return mem;
+}
+
 
 #ifdef FEATURE_COMINTEROP
 void emitCOMStubCall (ComCallMethodDesc *pCOMMethod, PCODE target);
@@ -456,8 +515,11 @@ struct HijackArgs
     DWORD64 X19, X20, X21, X22, X23, X24, X25, X26, X27, X28;
     union
     {
-        DWORD64 X0;
-        size_t ReturnValue;
+        struct {  
+             DWORD64 X0;  
+             DWORD64 X1;  
+         }; 
+        size_t ReturnValue[2];
     };
 };
 
@@ -519,10 +581,10 @@ typedef DPTR(StubPrecode) PTR_StubPrecode;
 
 struct NDirectImportPrecode {
 
-    static const int Type = 0x88;
+    static const int Type = 0x8B;
 
-    // adr x8, #16             ; Notice that x8 register is used to differentiate the stub from StubPrecode which uses x9
-    // ldp x10,x12,[x8]      ; =m_pTarget,m_pMethodDesc
+    // adr x11, #16             ; Notice that x11 register is used to differentiate the stub from StubPrecode which uses x9
+    // ldp x10,x12,[x11]      ; =m_pTarget,m_pMethodDesc
     // br x10
     // 4 byte padding for 8 byte allignement
     // dcd pTarget

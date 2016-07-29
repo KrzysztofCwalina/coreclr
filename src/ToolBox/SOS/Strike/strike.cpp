@@ -2229,13 +2229,13 @@ size_t FormatGeneratedException (DWORD_PTR dataPtr,
     __out_ecount_opt(bufferLength) WCHAR *wszBuffer, 
     size_t bufferLength, 
     BOOL bAsync,
-    BOOL bNestedCase=FALSE,
-    BOOL bLineNumbers=FALSE)
+    BOOL bNestedCase = FALSE,
+    BOOL bLineNumbers = FALSE)
 {
     UINT count = bytes / sizeof(StackTraceElement);
     size_t Length = 0;
 
-    if (wszBuffer && bufferLength>0)
+    if (wszBuffer && bufferLength > 0)
     {
         wszBuffer[0] = L'\0';
     }
@@ -2243,7 +2243,7 @@ size_t FormatGeneratedException (DWORD_PTR dataPtr,
     // Buffer is calculated for sprintf below ("   %p %p %S\n");
     WCHAR wszLineBuffer[mdNameLen + 8 + sizeof(size_t)*2 + MAX_LONGPATH + 8];
 
-    if (count==0)
+    if (count == 0)
     {
         return 0;
     }
@@ -2307,22 +2307,13 @@ size_t FormatGeneratedException (DWORD_PTR dataPtr,
         {
             char filename[MAX_LONGPATH+1] = "";
             ULONG linenum = 0;
-            if (bLineNumbers
-                    && FAILED(GetLineByOffset(TO_CDADDR(ste.ip), 
-                                     &linenum,
-                                     filename,
-                                     _countof(filename))))
+            if (bLineNumbers && SUCCEEDED(GetLineByOffset(TO_CDADDR(ste.ip), &linenum, filename, _countof(filename))))
             {
-                bLineNumbers = FALSE;
-            }
-
-            if (!bLineNumbers)
-            {
-                swprintf_s(wszLineBuffer, _countof(wszLineBuffer), W("    %s\n"), so.String());
+                swprintf_s(wszLineBuffer, _countof(wszLineBuffer), W("    %s [%S @ %d]\n"), so.String(), filename, linenum);
             }
             else
             {
-                swprintf_s(wszLineBuffer, _countof(wszLineBuffer), W("    %s [%S @ %d]\n"), so.String(), filename, linenum);
+                swprintf_s(wszLineBuffer, _countof(wszLineBuffer), W("    %s\n"), so.String());
             }
 
             Length += _wcslen(wszLineBuffer);
@@ -6391,7 +6382,6 @@ public:
             pModuleFilename = pSlash+1;
             pSlash = _wcschr(pModuleFilename, DIRECTORY_SEPARATOR_CHAR_W);
         }
-        return S_OK;
 #ifndef FEATURE_PAL
 
         ImageInfo ii;
@@ -6412,8 +6402,8 @@ public:
         {
             return S_FALSE;
         }
-        return Status;
 #endif // FEATURE_PAL
+        return S_OK;
     }
 
     HRESULT ResolvePendingNonModuleBoundBreakpoint(__in_z WCHAR* pFilename, DWORD lineNumber, TADDR mod, SymbolReader* pSymbolReader)
@@ -7117,9 +7107,13 @@ DECLARE_API(bpmd)
         // did we get dll and type name or file:line#? Search for a colon in the first arg
         // to see if it is in fact a file:line#
         CHAR* pColon = strchr(DllName.data, ':');
+#ifndef FEATURE_PAL 
+        if (FAILED(g_ExtSymbols->GetModuleByModuleName(MAIN_CLR_MODULE_NAME_A, 0, NULL, NULL))) {
+#else
         if (FAILED(g_ExtSymbols->GetModuleByModuleName(MAIN_CLR_DLL_NAME_A, 0, NULL, NULL))) {
-            ExtOut("File name:Line number not supported\n");
-           fBadParam = true;
+#endif
+           ExtOut("%s not loaded yet\n", MAIN_CLR_DLL_NAME_A);
+           return Status;
         }
 
         if(NULL != pColon)
@@ -8023,10 +8017,10 @@ DECLARE_API(GCInfo)
 
     // Mutable table pointer since we need to pass the appropriate
     // offset into the table to DumpGCTable.
-    BYTE *pTable = table;
+    GCInfoToken gcInfoToken = { table, GCINFO_VERSION };
     unsigned int methodSize = (unsigned int)codeHeaderData.MethodSize;
 
-    g_targetMachine->DumpGCInfo(pTable, methodSize, ExtOut, true /*encBytes*/, true /*bPrintHeader*/);
+    g_targetMachine->DumpGCInfo(gcInfoToken, methodSize, ExtOut, true /*encBytes*/, true /*bPrintHeader*/);
 
     return Status;
 }
@@ -8107,8 +8101,8 @@ void DecodeGCTableEntry (const char *fmt, ...)
 VOID CALLBACK DumpGCTableFiberEntry (LPVOID pvGCEncodingInfo)
 {
     GCEncodingInfo *pInfo = (GCEncodingInfo*)pvGCEncodingInfo;
-
-    g_targetMachine->DumpGCInfo(pInfo->table, pInfo->methodSize, DecodeGCTableEntry, false /*encBytes*/, false /*bPrintHeader*/);
+    GCInfoToken gcInfoToken = { pInfo, GCINFO_VERSION };
+    g_targetMachine->DumpGCInfo(gcInfoToken, pInfo->methodSize, DecodeGCTableEntry, false /*encBytes*/, false /*bPrintHeader*/);
 
     pInfo->fDoneDecoding = true;
     SwitchToFiber(pInfo->pvMainFiber);
@@ -9610,8 +9604,6 @@ DECLARE_API(GCRoot)
     return Status;
 }
 
-#ifndef FEATURE_PAL
-
 DECLARE_API(GCWhere)
 {
     INIT_API();
@@ -9730,6 +9722,8 @@ DECLARE_API(GCWhere)
 
     return Status;
 }
+
+#ifndef FEATURE_PAL
 
 DECLARE_API(FindRoots)
 {
@@ -11562,12 +11556,10 @@ private:
         IfFailRet(pLocalsEnum->GetCount(&cLocals));
         if (cLocals > 0 && bLocals)
         {
-#ifndef FEATURE_PAL
             bool symbolsAvailable = false;
             SymbolReader symReader;
             if(SUCCEEDED(symReader.LoadSymbols(pMD, pModule)))
                 symbolsAvailable = true;
-#endif
             ExtOut("\nLOCALS:\n");
             for (ULONG i=0; i < cLocals; i++)
             {
@@ -11575,13 +11567,11 @@ private:
                 WCHAR paramName[mdNameLen] = W("\0");
 
                 ToRelease<ICorDebugValue> pValue;
-#ifndef FEATURE_PAL
                 if(symbolsAvailable)
                 {
                     Status = symReader.GetNamedLocalVariable(pILFrame, i, paramName, mdNameLen, &pValue);
                 }
                 else
-#endif
                 {
                     ULONG cArgsFetched;
                     Status = pLocalsEnum->Next(1, &pValue, &cArgsFetched);

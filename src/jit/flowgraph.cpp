@@ -702,7 +702,7 @@ GenTreeStmt*  Compiler::fgInsertStmtNearEnd(BasicBlock* block, GenTreePtr node)
  *
  *  Insert the given statement "stmt" after GT_STMT node "insertionPoint".
  *  Returns the newly inserted GT_STMT node.
- *  Note that the gtPrev list of statment nodes is circular, but the gtNext list is not.
+ *  Note that the gtPrev list of statement nodes is circular, but the gtNext list is not.
  */
 
 GenTreePtr          Compiler::fgInsertStmtAfter(BasicBlock* block,
@@ -4225,51 +4225,55 @@ void                Compiler::fgMarkJumpTarget(BYTE* jumpTarget, unsigned offs)
     jumpTarget[offs] |= (jumpTarget[offs] & JT_JUMP) << 1 | JT_JUMP;
 }
 
-/*****************************************************************************
- *
- *  Walk the instrs and for any jumps we find set the appropriate entry
- *  in the 'jumpTarget' table.
- *  Also sets lvAddrExposed and lvArgWrite in lvaTable[]
- */
+//------------------------------------------------------------------------
+// FgStack: simple stack model for the inlinee's evaluation stack.
+//
+// Model the inputs available to various operations in the inline body.
+// Tracks constants, arguments, array lengths.
 
-#ifdef _PREFAST_
-#pragma warning(push)
-#pragma warning(disable:21000) // Suppress PREFast warning about overly large function
-#endif
-
-//Helpers to track stack transitions for conditional heuristics in fgFindJumpTargets
-const unsigned fgStackSlotInvalid = UINT_MAX;
-const unsigned fgStackSlotUnknown = 0;
-const unsigned fgStackSlotConstant = 1;
-const unsigned fgStackSlotArrayLen = 2;
-const unsigned fgStackSlotFirstArg = 3;
-
-class fgStack
+class FgStack
 {
 public:
-    fgStack() : depth(0)
+
+    FgStack()
+        : slot0(SLOT_INVALID)
+        , slot1(SLOT_INVALID)
+        , depth(0)
     {
-        slot0 = fgStackSlotInvalid;
-        slot1 = fgStackSlotInvalid;
+        // Empty
     }
 
-    //Removes everything from the stack.
-    inline void clear() { depth = 0; }
-    inline void pushUnknown() { push(fgStackSlotUnknown); }
-    inline void pushConstant() { push(fgStackSlotConstant); }
-    inline void pushArrayLen() { push(fgStackSlotArrayLen); }
-    inline void pushArgument(unsigned arg) { push(fgStackSlotFirstArg + arg); }
-    inline unsigned getSlot0() { assert(depth >= 1); return slot0; }
-    inline unsigned getSlot1() { assert(depth >= 2); return slot1; }
-    inline static bool isConstant(unsigned value) { return value == fgStackSlotConstant;}
-    inline static bool isArrayLen(unsigned value) { return value == fgStackSlotArrayLen;}
-    inline static bool isArgument(unsigned value) { return value >= fgStackSlotFirstArg;}
-    inline static unsigned slotTypeToArgNum(unsigned value) { return value - fgStackSlotFirstArg; }
-    inline bool isStackTwoDeep() { return depth == 2; }
-    inline bool isStackOneDeep() { return depth == 1; }
+    void Clear() { depth = 0; }
+    void PushUnknown() { Push(SLOT_UNKNOWN); }
+    void PushConstant() { Push(SLOT_CONSTANT); }
+    void PushArrayLen() { Push(SLOT_ARRAYLEN); }
+    void PushArgument(unsigned arg) { Push(SLOT_ARGUMENT + arg); }
+    unsigned GetSlot0() const { assert(depth >= 1); return slot0; }
+    unsigned GetSlot1() const { assert(depth >= 2); return slot1; }
+    static bool IsConstant(unsigned value) { return value == SLOT_CONSTANT; }
+    static bool IsArrayLen(unsigned value) { return value == SLOT_ARRAYLEN; }
+    static bool IsArgument(unsigned value) { return value >= SLOT_ARGUMENT; }
+    static unsigned SlotTypeToArgNum(unsigned value)
+    {
+        assert(IsArgument(value));
+        return value - SLOT_ARGUMENT;
+    }
+    bool IsStackTwoDeep() const { return depth == 2; }
+    bool IsStackOneDeep() const { return depth == 1; }
+    bool IsStackAtLeastOneDeep() const { return depth >= 1; }
 
 private:
-    inline void push(unsigned type)
+
+    enum
+    {
+        SLOT_INVALID  = UINT_MAX,
+        SLOT_UNKNOWN  = 0,
+        SLOT_CONSTANT = 1,
+        SLOT_ARRAYLEN = 2,
+        SLOT_ARGUMENT = 3
+    };
+
+    void Push(int type)
     {
         switch (depth)
         {
@@ -4285,6 +4289,7 @@ private:
             slot0 = type;
         }
     }
+
     unsigned slot0;
     unsigned slot1;
     unsigned depth;
@@ -4301,12 +4306,19 @@ private:
 // Notes:
 //    If inlining or prejitting the root, this method also makes
 //    various observations about the method that factor into inline
-//    decisions. It sets `compNativeSizeEstimate` as a side effect.
+//    decisions.
 //
 //    May throw an exception if the IL is malformed.
 //
 //    jumpTarget[N] is set to a JT_* value if IL offset N is a 
 //    jump target in the method.
+//
+//    Also sets lvAddrExposed and lvArgWrite in lvaTable[].
+
+#ifdef _PREFAST_
+#pragma warning(push)
+#pragma warning(disable:21000) // Suppress PREFast warning about overly large function
+#endif
 
 void Compiler::fgFindJumpTargets(const BYTE* codeAddr,
                                  IL_OFFSET   codeSize,
@@ -4319,7 +4331,7 @@ void Compiler::fgFindJumpTargets(const BYTE* codeAddr,
     var_types   varType      = DUMMY_INIT(TYP_UNDEF);  // TYP_ type
     typeInfo    ti;                                // Verifier type.
     bool        typeIsNormed = false;
-    fgStack     pushedStack;      // Keep track of constants and args on the stack.
+    FgStack     pushedStack;
     const bool  isForceInline = (info.compFlags & CORINFO_FLG_FORCEINLINE) != 0;
     const bool  makeInlineObservations = (compInlineResult != nullptr);
     const bool  isInlining = compIsForInlining();
@@ -4354,7 +4366,9 @@ void Compiler::fgFindJumpTargets(const BYTE* codeAddr,
 DECODE_OPCODE:
 
         if (opcode >= CEE_COUNT)
+        {
             BADCODE3("Illegal opcode", ": %02X", (int) opcode);
+        }
 
         if ((opcode >= CEE_LDARG_0 && opcode <= CEE_STLOC_S) ||
             (opcode >= CEE_LDARG   && opcode <= CEE_STLOC))
@@ -4366,26 +4380,23 @@ DECODE_OPCODE:
             (opcode >= CEE_LDNULL) &&
             (opcode <= CEE_LDC_R8))
         {
-            pushedStack.pushConstant();
+            pushedStack.PushConstant();
         }
 
         unsigned sz = opcodeSizes[opcode];
 
         switch (opcode)
         {
-              signed        jmpDist;
-            unsigned        jmpAddr;
-
-            // For CEE_SWITCH
-            unsigned        jmpBase;
-            unsigned        jmpCnt;
-
         case CEE_PREFIX1:
-            if (codeAddr >= codeEndp)
-                goto TOO_FAR;
-            opcode = (OPCODE) (256+getU1LittleEndian(codeAddr));
-            codeAddr += sizeof(__int8);
-            goto DECODE_OPCODE;
+            {
+                if (codeAddr >= codeEndp)
+                {
+                    goto TOO_FAR;
+                }
+                opcode = (OPCODE) (256 + getU1LittleEndian(codeAddr));
+                codeAddr += sizeof(__int8);
+                goto DECODE_OPCODE;
+            }
 
         case CEE_PREFIX2:
         case CEE_PREFIX3:
@@ -4394,38 +4405,36 @@ DECODE_OPCODE:
         case CEE_PREFIX6:
         case CEE_PREFIX7:
         case CEE_PREFIXREF:
-            BADCODE3("Illegal opcode", ": %02X", (int) opcode);
+            {
+                BADCODE3("Illegal opcode", ": %02X", (int) opcode);
+            }
 
         case CEE_CALL:
         case CEE_CALLVIRT:
-
-            if (isInlining)
             {
-                //There has to be code after the call, otherwise the inlinee is unverifiable.
-                noway_assert(codeAddr < codeEndp - sz);
-            }
-
-            // If the method has a call followed by a ret, assume that
-            // it is a wrapper method.
-
-            if (makeInlineObservations)
-            {
-                if ((OPCODE) getU1LittleEndian(codeAddr + sz) == CEE_RET)
+                // There has to be code after the call, otherwise the inlinee is unverifiable.
+                if (isInlining)
                 {
-                    compInlineResult->Note(InlineObservation::CALLEE_LOOKS_LIKE_WRAPPER);
+
+                    noway_assert(codeAddr < codeEndp - sz);
+                }
+
+                // If the method has a call followed by a ret, assume that
+                // it is a wrapper method.
+                if (makeInlineObservations)
+                {
+                    if ((OPCODE) getU1LittleEndian(codeAddr + sz) == CEE_RET)
+                    {
+                        compInlineResult->Note(InlineObservation::CALLEE_LOOKS_LIKE_WRAPPER);
+                    }
                 }
             }
             break;
-
-        /* Check for an unconditional jump opcode */
 
         case CEE_LEAVE:
         case CEE_LEAVE_S:
         case CEE_BR:
         case CEE_BR_S:
-
-        /* Check for a conditional jump opcode */
-
         case CEE_BRFALSE:
         case CEE_BRFALSE_S:
         case CEE_BRTRUE:
@@ -4450,134 +4459,278 @@ DECODE_OPCODE:
         case CEE_BLT_UN_S:
         case CEE_BNE_UN:
         case CEE_BNE_UN_S:
-
-            seenJump = true;
-
-            if (codeAddr > codeEndp - sz)
-                goto TOO_FAR;
-
-            /* Compute the target address of the jump */
-
-            jmpDist = (sz==1) ? getI1LittleEndian(codeAddr)
-                              : getI4LittleEndian(codeAddr);
-
-            if (compIsForInlining() && jmpDist == 0 && (opcode == CEE_LEAVE || opcode == CEE_LEAVE_S
-                                                        || opcode == CEE_BR || opcode == CEE_BR_S))
-                break;  /* NOP */
-
-            jmpAddr = (IL_OFFSET)(codeAddr - codeBegp) + sz + jmpDist;
-
-            /* Make sure the target address is reasonable */
-
-            if  (jmpAddr >= codeSize)
             {
-                BADCODE3("code jumps to outer space",
-                         " at offset %04X", (IL_OFFSET)(codeAddr - codeBegp));
+                seenJump = true;
+
+                if (codeAddr > codeEndp - sz)
+                {
+                    goto TOO_FAR;
+                }
+
+                // Compute jump target address
+                signed jmpDist = (sz==1) ? getI1LittleEndian(codeAddr)
+                                         : getI4LittleEndian(codeAddr);
+
+                if (compIsForInlining() && jmpDist == 0 && (opcode == CEE_LEAVE || opcode == CEE_LEAVE_S
+                                                            || opcode == CEE_BR || opcode == CEE_BR_S))
+                {
+                    break;  /* NOP */
+                }
+
+                unsigned jmpAddr = (IL_OFFSET)(codeAddr - codeBegp) + sz + jmpDist;
+
+                // Make sure target is reasonable
+                if  (jmpAddr >= codeSize)
+                {
+                    BADCODE3("code jumps to outer space",
+                             " at offset %04X", (IL_OFFSET)(codeAddr - codeBegp));
+                }
+
+                // Mark the jump target
+                fgMarkJumpTarget(jumpTarget, jmpAddr);
+
+                // See if jump might be sensitive to inlining
+                if (makeInlineObservations && (opcode != CEE_BR_S) && (opcode != CEE_BR))
+                {
+                    fgObserveInlineConstants(opcode, pushedStack, isInlining);
+                }
             }
-
-            /* Finally, set the 'jump target' flag */
-
-            fgMarkJumpTarget(jumpTarget, jmpAddr);
-
-            if (makeInlineObservations && (opcode != CEE_BR_S) && (opcode != CEE_BR))
-            {
-                goto INL_HANDLE_COMPARE;
-            }
-
             break;
 
         case CEE_SWITCH:
-
-            seenJump = true;
-
-            if (makeInlineObservations)
             {
-                compInlineResult->Note(InlineObservation::CALLEE_HAS_SWITCH);
+                seenJump = true;
 
-                // Fail fast, if we're inlining and can't handle this.
-                if (isInlining && compInlineResult->IsFailure()) 
+                if (makeInlineObservations)
                 {
-                    return;
+                    compInlineResult->Note(InlineObservation::CALLEE_HAS_SWITCH);
+
+                    // Fail fast, if we're inlining and can't handle this.
+                    if (isInlining && compInlineResult->IsFailure())
+                    {
+                        return;
+                    }
                 }
+
+                // Make sure we don't go past the end reading the number of cases
+                if (codeAddr > codeEndp - sizeof(DWORD))
+                {
+                    goto TOO_FAR;
+                }
+
+                // Read the number of cases
+                unsigned jmpCnt = getU4LittleEndian(codeAddr);
+                codeAddr += sizeof(DWORD);
+
+                if (jmpCnt > codeSize / sizeof(DWORD))
+                {
+                    goto TOO_FAR;
+                }
+
+                // Find the end of the switch table
+                unsigned jmpBase = (unsigned)((codeAddr - codeBegp) + jmpCnt*sizeof(DWORD));
+
+                // Make sure there is more code after the switch
+                if (jmpBase >= codeSize)
+                {
+                    goto TOO_FAR;
+                }
+
+                // jmpBase is also the target of the default case, so mark it
+                fgMarkJumpTarget(jumpTarget, jmpBase);
+
+                // Process table entries
+                while (jmpCnt > 0)
+                {
+                    unsigned jmpAddr = jmpBase + getI4LittleEndian(codeAddr);
+                    codeAddr += 4;
+
+                    if (jmpAddr >= codeSize)
+                    {
+                        BADCODE3("jump target out of range",
+                                 " at offset %04X", (IL_OFFSET)(codeAddr - codeBegp));
+                    }
+
+                    fgMarkJumpTarget(jumpTarget, jmpAddr);
+                    jmpCnt--;
+                }
+
+                // We've advanced past all the bytes in this instruction
+                sz = 0;
             }
-
-            // Make sure we don't go past the end reading the number of cases
-
-            if  (codeAddr > codeEndp - sizeof(DWORD))
-                goto TOO_FAR;
-
-            // Read the number of cases
-
-            jmpCnt = getU4LittleEndian(codeAddr);
-            codeAddr += sizeof(DWORD);
-
-            if (jmpCnt > codeSize / sizeof(DWORD))
-                goto TOO_FAR;
-
-            // Find the end of the switch table
-
-            jmpBase = (unsigned)((codeAddr - codeBegp) + jmpCnt*sizeof(DWORD));
-
-            /* Make sure we have room for the switch table */
-
-            if  (jmpBase >= codeSize)
-                goto TOO_FAR;
-
-            // jmpBase is also the target of the default case, so mark it
-
-            fgMarkJumpTarget(jumpTarget, jmpBase);
-
-            /* Process all the entries in the jump table */
-
-            while (jmpCnt)
-            {
-                jmpAddr = jmpBase + getI4LittleEndian(codeAddr);
-                codeAddr += 4;
-
-                if  (jmpAddr >= codeSize)
-                    BADCODE3("jump target out of range",
-                             " at offset %04X", (IL_OFFSET)(codeAddr - codeBegp));
-
-                fgMarkJumpTarget(jumpTarget, jmpAddr);
-
-                jmpCnt--;
-            }
-
-            /* We've now consumed the entire switch opcode */
-
-            goto _SkipCodeAddrAdjustment;
+            break;
 
         case CEE_UNALIGNED:
         case CEE_CONSTRAINED:
         case CEE_READONLY:
         case CEE_VOLATILE:
         case CEE_TAILCALL:
-            if (codeAddr >= codeEndp)
-                goto TOO_FAR;
+            {
+                if (codeAddr >= codeEndp)
+                {
+                    goto TOO_FAR;
+                }
+            }
             break;
 
         case CEE_STARG:
-        case CEE_STARG_S:     goto ARG_WRITE;
+        case CEE_STARG_S:
+            {
+                if (makeInlineObservations)
+                {
+                    // The inliner keeps the args as trees and clones
+                    // them.  Storing the arguments breaks that
+                    // simplification.  To allow this, flag the argument
+                    // as written to and spill it before inlining.  That
+                    // way the STARG in the inlinee is trivial.
+                    //
+                    // Arguably this should be NoteFatal, but the legacy behavior is
+                    // to ignore this for the prejit root.
+                    compInlineResult->Note(InlineObservation::CALLEE_STORES_TO_ARGUMENT);
+
+                    // Fail fast, if inlining
+                    if (isInlining)
+                    {
+                        assert(compInlineResult->IsFailure());
+                        JITDUMP("INLINER: Inline expansion aborted; opcode at offset [%02u]"
+                                " writes to an argument\n", codeAddr-codeBegp-1);
+                        return;
+                    }
+                }
+
+                // In non-inline cases, note written-to locals.
+                if (!isInlining)
+                {
+                    noway_assert(sz == sizeof(BYTE) || sz == sizeof(WORD));
+
+                    if (codeAddr > codeEndp - sz)
+                    {
+                        goto TOO_FAR;
+                    }
+
+                    varNum = (sz == sizeof(BYTE)) ? getU1LittleEndian(codeAddr)
+                                                  : getU2LittleEndian(codeAddr);
+                    varNum = compMapILargNum(varNum); // account for possible hidden param
+
+                    // This check is only intended to prevent an AV.  Bad varNum values will later
+                    // be handled properly by the verifier.
+                    if (varNum < lvaTableCnt)
+                    {
+                        lvaTable[varNum].lvArgWrite = 1;
+                    }
+                }
+            }
+            break;
 
         case CEE_LDARGA:
         case CEE_LDARGA_S:
         case CEE_LDLOCA:
-        case CEE_LDLOCA_S:    goto ADDR_TAKEN;
+        case CEE_LDLOCA_S:
+            {
+                // Handle address-taken args or locals
+                noway_assert(sz == sizeof(BYTE) || sz == sizeof(WORD));
 
-        // Other opcodes that we know inliner won't handle.
-        case CEE_THROW:
-            if (seenJump)
-                break;
-        case CEE_ISINST:
-        case CEE_CASTCLASS:
-        case CEE_SIZEOF:
-        case CEE_LDTOKEN:
-        case CEE_UNBOX:
-            //Needs weight value in SMWeights.cpp
-        case CEE_UNBOX_ANY:
+                if (codeAddr > codeEndp - sz)
+                {
+                    goto TOO_FAR;
+                }
+
+                varNum = (sz == sizeof(BYTE)) ? getU1LittleEndian(codeAddr)
+                                              : getU2LittleEndian(codeAddr);
+
+                if (isInlining)
+                {
+                    if (opcode == CEE_LDLOCA || opcode == CEE_LDLOCA_S)
+                    {
+                        varType = impInlineInfo->lclVarInfo[varNum + impInlineInfo->argCnt].lclTypeInfo;
+                        ti      = impInlineInfo->lclVarInfo[varNum + impInlineInfo->argCnt].lclVerTypeInfo;
+
+                        impInlineInfo->lclVarInfo[varNum + impInlineInfo->argCnt].lclHasLdlocaOp = true;
+                    }
+                    else
+                    {
+                        noway_assert(opcode == CEE_LDARGA || opcode == CEE_LDARGA_S);
+
+                        varType = impInlineInfo->lclVarInfo[varNum].lclTypeInfo;
+                        ti      = impInlineInfo->lclVarInfo[varNum].lclVerTypeInfo;
+
+                        impInlineInfo->inlArgInfo[varNum].argHasLdargaOp = true;
+
+                        pushedStack.PushArgument(varNum);
+                    }
+                }
+                else
+                {
+                    if (opcode == CEE_LDLOCA || opcode == CEE_LDLOCA_S)
+                    {
+                        if (varNum >= info.compMethodInfo->locals.numArgs)
+                        {
+                            BADCODE("bad local number");
+                        }
+
+                        varNum += info.compArgsCount;
+                    }
+                    else
+                    {
+                        noway_assert(opcode == CEE_LDARGA || opcode == CEE_LDARGA_S);
+
+                        if (varNum >= info.compILargsCount)
+                        {
+                            BADCODE("bad argument number");
+                        }
+
+                        varNum = compMapILargNum(varNum); // account for possible hidden param
+                    }
+
+                    varType = (var_types)lvaTable[varNum].lvType;
+                    ti      = lvaTable[varNum].lvVerTypeInfo;
+
+                    // Determine if the next instruction will consume
+                    // the address. If so we won't mark this var as
+                    // address taken.
+                    //
+                    // We will put structs on the stack and changing
+                    // the addrTaken of a local requires an extra pass
+                    // in the morpher so we won't apply this
+                    // optimization to structs.
+                    //
+                    // Debug code spills for every IL instruction, and
+                    // therefore it will split statements, so we will
+                    // need the address.  Note that this optimization
+                    // is based in that we know what trees we will
+                    // generate for this ldfld, and we require that we
+                    // won't need the address of this local at all
+                    noway_assert(varNum < lvaTableCnt);
+
+                    const bool notStruct    = !varTypeIsStruct(&lvaTable[varNum]);
+                    const bool notLastInstr = (codeAddr < codeEndp - sz);
+                    const bool notDebugCode = !opts.compDbgCode;
+
+                    if (notStruct && notLastInstr && notDebugCode &&
+                        impILConsumesAddr(codeAddr + sz, impTokenLookupContextHandle, info.compScopeHnd))
+                    {
+                        // We can skip the addrtaken, as next IL instruction consumes
+                        // the address.
+                    }
+                    else
+                    {
+                        lvaTable[varNum].lvHasLdAddrOp = 1;
+                        if (!info.compIsStatic && (varNum == 0))
+                        {
+                            // Addr taken on "this" pointer is significant,
+                            // go ahead to mark it as permanently addr-exposed here.
+                            lvaSetVarAddrExposed(0);
+                            // This may be conservative, but probably not very.
+                        }
+                    }
+                } // isInlining
+
+                typeIsNormed = ti.IsValueClass() && !varTypeIsStruct(varType);
+            }
             break;
 
         case CEE_JMP:
+
 #if !defined(_TARGET_X86_) && !defined(_TARGET_ARM_)
             if (!isInlining)
             {
@@ -4602,7 +4755,6 @@ DECODE_OPCODE:
         // so we can generate an inlined call frame. It might be nice to call getCallInfo to figure out what kind of
         // call we have here.
         case CEE_CALLI:
-            //Needs weight value in SMWeights.cpp
         case CEE_LOCALLOC:
         case CEE_MKREFANY:
         case CEE_RETHROW:
@@ -4623,25 +4775,37 @@ DECODE_OPCODE:
             break;
 
         case CEE_LDARG_0:
-            varNum = 0; goto ARG_PUSH;
         case CEE_LDARG_1:
-            varNum = 1; goto ARG_PUSH;
         case CEE_LDARG_2:
-            varNum = 2; goto ARG_PUSH;
         case CEE_LDARG_3:
-            varNum = 3; goto ARG_PUSH;
+            if (makeInlineObservations)
+            {
+                pushedStack.PushArgument(opcode - CEE_LDARG_0);
+            }
+            break;
+
         case CEE_LDARG_S:
         case CEE_LDARG:
-            if (codeAddr > codeEndp - sz)
-                goto TOO_FAR;
-            varNum = (sz == sizeof(BYTE)) ? getU1LittleEndian(codeAddr)
-                                          : getU2LittleEndian(codeAddr);
-            goto ARG_PUSH;
+            {
+                if (codeAddr > codeEndp - sz)
+                {
+                    goto TOO_FAR;
+                }
+
+                varNum = (sz == sizeof(BYTE)) ? getU1LittleEndian(codeAddr)
+                                              : getU2LittleEndian(codeAddr);
+
+                if (makeInlineObservations)
+                {
+                    pushedStack.PushArgument(varNum);
+                }
+            }
+            break;
 
         case CEE_LDLEN:
             if (makeInlineObservations)
             {
-                pushedStack.pushArrayLen();
+                pushedStack.PushArrayLen();
             }
             break;
 
@@ -4652,236 +4816,18 @@ DECODE_OPCODE:
         case CEE_CLT_UN:
             if (makeInlineObservations)
             {
-                goto INL_HANDLE_COMPARE;
+                fgObserveInlineConstants(opcode, pushedStack, isInlining);
             }
             break;
 
         default:
             break;
-
-INL_HANDLE_COMPARE:
-            assert(makeInlineObservations);
-            //We're looking at a comparison.  There are several cases that we would like to recognize for
-            //inlining:
-            //  Static cases
-            //      - An incoming argument is compared against a constant
-            //      - An incoming argument is compared against an array length
-            //
-            //  Dynamic cases
-            //      - An incoming argument which is a constant is used in a comparison.
-            {
-                if (!pushedStack.isStackTwoDeep())
-                {
-                    //The stack only has to be 1 deep for BRTRUE/FALSE
-                    if (pushedStack.isStackOneDeep())
-                    {
-                        if (opcode == CEE_BRFALSE || opcode == CEE_BRFALSE_S ||
-                            opcode == CEE_BRTRUE || opcode == CEE_BRTRUE_S)
-                        {
-                            unsigned slot0 = pushedStack.getSlot0();
-                            if (fgStack::isArgument(slot0))
-                            {
-                                compInlineResult->Note(InlineObservation::CALLEE_ARG_FEEDS_CONSTANT_TEST);
-
-                                if (isInlining)
-                                {
-                                    // Check for the double whammy of an incoming constant argument
-                                    // feeding a constant test.
-                                    varNum = fgStack::slotTypeToArgNum(slot0);
-                                    if (impInlineInfo->inlArgInfo[varNum].argNode->OperIsConst())
-                                    {
-                                        compInlineResult->Note(InlineObservation::CALLSITE_CONSTANT_ARG_FEEDS_TEST);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    break;
-                }
-
-                unsigned slot0 = pushedStack.getSlot0();
-                unsigned slot1 = pushedStack.getSlot1();
-
-                // Arg feeds constant test.
-                if ((fgStack::isConstant(slot0) && fgStack::isArgument(slot1))
-                    ||(fgStack::isConstant(slot1) && fgStack::isArgument(slot0)))
-                {
-                    compInlineResult->Note(InlineObservation::CALLEE_ARG_FEEDS_CONSTANT_TEST);
-                }
-
-                // Arg feeds range check
-                if ((fgStack::isArrayLen(slot0) && fgStack::isArgument(slot1))
-                    ||(fgStack::isArrayLen(slot1) && fgStack::isArgument(slot0)))
-                {
-                    compInlineResult->Note(InlineObservation::CALLEE_ARG_FEEDS_RANGE_CHECK);
-                }
-
-                // Check for an incoming arg that's a constant.
-                if (isInlining)
-                {
-                    if (fgStack::isArgument(slot0))
-                    {
-                        varNum = fgStack::slotTypeToArgNum(slot0);
-                        if (impInlineInfo->inlArgInfo[varNum].argNode->OperIsConst())
-                        {
-                            compInlineResult->Note(InlineObservation::CALLSITE_CONSTANT_ARG_FEEDS_TEST);
-                        }
-                    }
-
-                    if (fgStack::isArgument(slot1))
-                    {
-                        varNum = fgStack::slotTypeToArgNum(slot1);
-                        if (impInlineInfo->inlArgInfo[varNum].argNode->OperIsConst())
-                        {
-                            compInlineResult->Note(InlineObservation::CALLSITE_CONSTANT_ARG_FEEDS_TEST);
-                        }
-                    }
-                }
-            }
-            break;
-ARG_PUSH:
-            if (makeInlineObservations)
-            {
-                pushedStack.pushArgument(varNum);
-            }
-
-            break;
-
-ADDR_TAKEN:
-            noway_assert(sz == sizeof(BYTE) || sz == sizeof(WORD));
-            if (codeAddr > codeEndp - sz)
-                goto TOO_FAR;
-            varNum = (sz == sizeof(BYTE)) ? getU1LittleEndian(codeAddr)
-                                          : getU2LittleEndian(codeAddr);
-
-            if (isInlining)
-            {
-                if (opcode == CEE_LDLOCA   ||
-                    opcode == CEE_LDLOCA_S)
-                {
-                    varType = impInlineInfo->lclVarInfo[varNum + impInlineInfo->argCnt].lclTypeInfo;
-                    ti      = impInlineInfo->lclVarInfo[varNum + impInlineInfo->argCnt].lclVerTypeInfo;
-
-                    impInlineInfo->lclVarInfo[varNum + impInlineInfo->argCnt].lclHasLdlocaOp = true;
-                }
-                else
-                {
-                    noway_assert(opcode == CEE_LDARGA || opcode == CEE_LDARGA_S);
-
-                    varType = impInlineInfo->lclVarInfo[varNum].lclTypeInfo;
-                    ti      = impInlineInfo->lclVarInfo[varNum].lclVerTypeInfo;
-
-                    impInlineInfo->inlArgInfo[varNum].argHasLdargaOp = true;
-
-                    pushedStack.pushArgument(varNum);
-                }
-            }
-            else
-            {
-                if (opcode == CEE_LDLOCA || opcode == CEE_LDLOCA_S)
-                {
-                    if (varNum >= info.compMethodInfo->locals.numArgs)
-                        BADCODE("bad local number");
-
-                    varNum += info.compArgsCount;
-                }
-                else
-                {
-                    noway_assert(opcode == CEE_LDARGA || opcode == CEE_LDARGA_S);
-                    if (varNum >= info.compILargsCount)
-                        BADCODE("bad argument number");
-
-                    varNum = compMapILargNum(varNum); // account for possible hidden param
-                }
-
-                varType = (var_types)lvaTable[varNum].lvType;
-                ti      = lvaTable[varNum].lvVerTypeInfo;
-
-                if (!varTypeIsStruct(&lvaTable[varNum]) && // We will put structs in the stack anyway
-                                                                // And changing the addrTaken of a local
-                                                                // requires an extra pass in the morpher
-                                                                // so we won't apply this optimization
-                                                                // to structs.
-                    codeAddr < codeEndp - sz    && // This is not the last instruction
-                    impILConsumesAddr(codeAddr + sz, impTokenLookupContextHandle, info.compScopeHnd) &&
-                    opts.compDbgCode == false)   // Debug code spills for every IL instruction, and therefore
-                                                 // it will split statements, so we will need the address.
-                                                 // Note that this optimization is based in that we know
-                                                 // what trees we will generate for this ldfld, and we
-                                                 // require that we won't need the address of this local
-                                                 // at all
-                {
-                    // We can skip the addrtaken, as next IL instruction consumes
-                    // the address. 
-#ifdef DEBUG
-                    noway_assert(varNum < lvaTableCnt);
-#endif
-                }
-                else
-                {
-                    noway_assert(varNum < lvaTableCnt);
-                    lvaTable[varNum].lvHasLdAddrOp = 1;
-                    if (!info.compIsStatic &&
-                        varNum == 0)
-                    {
-                        // Addr taken on "this" pointer is significant,
-                        // go ahead to mark it as permanently addr-exposed here.
-                        lvaSetVarAddrExposed(0);
-                        // This may be conservative, but probably not very.
-                    }
-                }
-            } // isInlining
-
-            typeIsNormed = ti.IsValueClass() && !varTypeIsStruct(varType);
-            break;
-
-ARG_WRITE:
-            if (makeInlineObservations)
-            {
-                /* The inliner keeps the args as trees and clones them.  Storing the arguments breaks that
-                 * simplification.  To allow this, flag the argument as written to and spill it before
-                 * inlining.  That way the STARG in the inlinee is trivial. */
-
-                // Arguably this should be NoteFatal, but the legacy behavior is
-                // to ignore this for the prejit root.
-                compInlineResult->Note(InlineObservation::CALLEE_STORES_TO_ARGUMENT);
-
-                // Fail fast, if inlining
-                if (isInlining)
-                {
-                    assert(compInlineResult->IsFailure());
-                    JITDUMP("INLINER: Inline expansion aborted; opcode at offset [%02u]"
-                            " writes to an argument\n", codeAddr-codeBegp-1);
-                    return;
-                }
-            }
-
-            // In non-inline cases, note written-to locals.
-
-            if (!isInlining)
-            {
-                noway_assert(sz == sizeof(BYTE) || sz == sizeof(WORD));
-                if (codeAddr > codeEndp - sz)
-                goto TOO_FAR;
-                varNum = (sz == sizeof(BYTE)) ? getU1LittleEndian(codeAddr)
-                                              : getU2LittleEndian(codeAddr);
-                varNum = compMapILargNum(varNum); // account for possible hidden param
-
-                // This check is only intended to prevent an AV.  Bad varNum values will later
-                // be handled properly by the verifier.
-                if (varNum < lvaTableCnt)
-                    lvaTable[varNum].lvArgWrite = 1;
-            }
-            break;
         }
 
-        /* Skip any operands this opcode may have */
-
+        // Skip any remaining operands this opcode may have
         codeAddr += sz;
 
-_SkipCodeAddrAdjustment:
-        ;
-
+        // Note the opcode we just saw
         if (makeInlineObservations)
         {
             InlineObservation obs = typeIsNormed ?
@@ -4890,7 +4836,7 @@ _SkipCodeAddrAdjustment:
         }
     }
 
-    if  (codeAddr != codeEndp)
+    if (codeAddr != codeEndp)
     {
 TOO_FAR:
         BADCODE3("Code ends in the middle of an opcode, or there is a branch past the end of the method",
@@ -4942,41 +4888,162 @@ TOO_FAR:
     // Therefore we should NOT need to enter this "if" statement.
     if (!isInlining && !info.compIsStatic)
     {
-        //If we're verifying, then we can't do this.  This flag makes the method unverifiable from the
-        //Importer's point of view.
-        if (!tiVerificationNeeded && compStressCompile(STRESS_GENERIC_VARN, 15))
-            lvaTable[info.compThisArg].lvArgWrite = true;
-
-        if (lvaTable[info.compThisArg].lvAddrExposed || lvaTable[info.compThisArg].lvArgWrite)
-        {
-            // If there is a "ldarga 0" or "starg 0", grab and use the temp.
-            lvaArg0Var = lvaGrabTemp(false DEBUGARG("Address-exposed, or written, this pointer"));
-            noway_assert(lvaArg0Var > (unsigned)info.compThisArg);
-            lvaTable[lvaArg0Var].lvType = lvaTable[info.compThisArg].TypeGet();
-            lvaTable[lvaArg0Var].lvAddrExposed = lvaTable[info.compThisArg].lvAddrExposed;
-            lvaTable[lvaArg0Var].lvDoNotEnregister = lvaTable[info.compThisArg].lvDoNotEnregister;
-#ifdef DEBUG
-            lvaTable[lvaArg0Var].lvVMNeedsStackAddr = lvaTable[info.compThisArg].lvVMNeedsStackAddr;
-            lvaTable[lvaArg0Var].lvLiveInOutOfHndlr = lvaTable[info.compThisArg].lvLiveInOutOfHndlr;
-            lvaTable[lvaArg0Var].lvLclFieldExpr = lvaTable[info.compThisArg].lvLclFieldExpr;
-            lvaTable[lvaArg0Var].lvLiveAcrossUCall = lvaTable[info.compThisArg].lvLiveAcrossUCall;
-#endif
-            lvaTable[lvaArg0Var].lvArgWrite = lvaTable[info.compThisArg].lvArgWrite;
-            lvaTable[lvaArg0Var].lvVerTypeInfo = lvaTable[info.compThisArg].lvVerTypeInfo;
-
-            // Clear the TI_FLAG_THIS_PTR in the original 'this' pointer.
-            noway_assert(lvaTable[lvaArg0Var].lvVerTypeInfo.IsThisPtr());
-            lvaTable[info.compThisArg].lvVerTypeInfo.ClearThisPtr();
-            lvaTable[info.compThisArg].lvAddrExposed = false;
-            lvaTable[info.compThisArg].lvArgWrite = false;
-        }
+        fgAdjustForAddressExposedOrWrittenThis();
     }
-
-    return;
 }
+
 #ifdef _PREFAST_
 #pragma warning(pop)
 #endif
+
+//------------------------------------------------------------------------
+// fgAdjustForAddressExposedOrWrittenThis: update var table for cases
+//   where the this pointer value can change.
+//
+// Notes:
+//    Modifies lvaArg0Var to refer to a temp if the value of 'this' can
+//    change. The original this (info.compThisArg) then remains
+//    unmodified in the method.  fgAddInternal is reponsible for
+//    adding the code to copy the initial this into the temp.
+
+void Compiler::fgAdjustForAddressExposedOrWrittenThis()
+{
+    // Optionally enable adjustment during stress.
+    if (!tiVerificationNeeded && compStressCompile(STRESS_GENERIC_VARN, 15))
+    {
+        lvaTable[info.compThisArg].lvArgWrite = true;
+    }
+
+    // If this is exposed or written to, create a temp for the modifiable this
+    if (lvaTable[info.compThisArg].lvAddrExposed || lvaTable[info.compThisArg].lvArgWrite)
+    {
+        // If there is a "ldarga 0" or "starg 0", grab and use the temp.
+        lvaArg0Var = lvaGrabTemp(false DEBUGARG("Address-exposed, or written this pointer"));
+        noway_assert(lvaArg0Var > (unsigned)info.compThisArg);
+        lvaTable[lvaArg0Var].lvType = lvaTable[info.compThisArg].TypeGet();
+        lvaTable[lvaArg0Var].lvAddrExposed = lvaTable[info.compThisArg].lvAddrExposed;
+        lvaTable[lvaArg0Var].lvDoNotEnregister = lvaTable[info.compThisArg].lvDoNotEnregister;
+#ifdef DEBUG
+        lvaTable[lvaArg0Var].lvVMNeedsStackAddr = lvaTable[info.compThisArg].lvVMNeedsStackAddr;
+        lvaTable[lvaArg0Var].lvLiveInOutOfHndlr = lvaTable[info.compThisArg].lvLiveInOutOfHndlr;
+        lvaTable[lvaArg0Var].lvLclFieldExpr = lvaTable[info.compThisArg].lvLclFieldExpr;
+        lvaTable[lvaArg0Var].lvLiveAcrossUCall = lvaTable[info.compThisArg].lvLiveAcrossUCall;
+#endif
+        lvaTable[lvaArg0Var].lvArgWrite = lvaTable[info.compThisArg].lvArgWrite;
+        lvaTable[lvaArg0Var].lvVerTypeInfo = lvaTable[info.compThisArg].lvVerTypeInfo;
+
+        // Clear the TI_FLAG_THIS_PTR in the original 'this' pointer.
+        noway_assert(lvaTable[lvaArg0Var].lvVerTypeInfo.IsThisPtr());
+        lvaTable[info.compThisArg].lvVerTypeInfo.ClearThisPtr();
+        lvaTable[info.compThisArg].lvAddrExposed = false;
+        lvaTable[info.compThisArg].lvArgWrite = false;
+    }
+}
+
+//------------------------------------------------------------------------
+// fgObserveInlineConstants: look for operations that might get optimized
+//   if this method were to be inlined, and report these to the inliner.
+//
+// Arguments:
+//    opcode     -- MSIL opcode under consideration
+//    stack      -- abstract stack model at this point in the IL
+//    isInlining -- true if we're inlining (vs compiling a prejit root)
+//
+// Notes:
+//    Currently only invoked on compare and branch opcodes.
+//
+//    If we're inlining we also look at the argument values supplied by
+//    the caller at this call site.
+//
+//    The crude stack model may overestimate stack depth.
+
+void Compiler::fgObserveInlineConstants(OPCODE opcode, const FgStack& stack, bool isInlining)
+{
+    // We should be able to record inline observations.
+    assert(compInlineResult != nullptr);
+
+    // The stack only has to be 1 deep for BRTRUE/FALSE
+    bool lookForBranchCases = stack.IsStackAtLeastOneDeep();
+
+    if (compInlineResult->UsesLegacyPolicy())
+    {
+        // LegacyPolicy misses cases where the stack is really one
+        // deep but the model says it's two deep. We need to do
+        // likewise to preseve old behavior.
+        lookForBranchCases &= !stack.IsStackTwoDeep();
+    }
+
+    if (lookForBranchCases)
+    {
+        if (opcode == CEE_BRFALSE || opcode == CEE_BRFALSE_S ||
+            opcode == CEE_BRTRUE || opcode == CEE_BRTRUE_S)
+        {
+            unsigned slot0 = stack.GetSlot0();
+            if (FgStack::IsArgument(slot0))
+            {
+                compInlineResult->Note(InlineObservation::CALLEE_ARG_FEEDS_CONSTANT_TEST);
+
+                if (isInlining)
+                {
+                    // Check for the double whammy of an incoming constant argument
+                    // feeding a constant test.
+                    unsigned varNum = FgStack::SlotTypeToArgNum(slot0);
+                    if (impInlineInfo->inlArgInfo[varNum].argNode->OperIsConst())
+                    {
+                        compInlineResult->Note(InlineObservation::CALLSITE_CONSTANT_ARG_FEEDS_TEST);
+                    }
+                }
+            }
+
+            return;
+        }
+    }
+
+    // Remaining cases require at least two things on the stack.
+    if (!stack.IsStackTwoDeep())
+    {
+        return;
+    }
+
+    unsigned slot0 = stack.GetSlot0();
+    unsigned slot1 = stack.GetSlot1();
+
+    // Arg feeds constant test
+    if ((FgStack::IsConstant(slot0) && FgStack::IsArgument(slot1))
+        ||(FgStack::IsConstant(slot1) && FgStack::IsArgument(slot0)))
+    {
+        compInlineResult->Note(InlineObservation::CALLEE_ARG_FEEDS_CONSTANT_TEST);
+    }
+
+    // Arg feeds range check
+    if ((FgStack::IsArrayLen(slot0) && FgStack::IsArgument(slot1))
+        ||(FgStack::IsArrayLen(slot1) && FgStack::IsArgument(slot0)))
+    {
+        compInlineResult->Note(InlineObservation::CALLEE_ARG_FEEDS_RANGE_CHECK);
+    }
+
+    // Check for an incoming arg that's a constant
+    if (isInlining)
+    {
+        if (FgStack::IsArgument(slot0))
+        {
+            unsigned varNum = FgStack::SlotTypeToArgNum(slot0);
+            if (impInlineInfo->inlArgInfo[varNum].argNode->OperIsConst())
+            {
+                compInlineResult->Note(InlineObservation::CALLSITE_CONSTANT_ARG_FEEDS_TEST);
+            }
+        }
+
+        if (FgStack::IsArgument(slot1))
+        {
+            unsigned varNum = FgStack::SlotTypeToArgNum(slot1);
+            if (impInlineInfo->inlArgInfo[varNum].argNode->OperIsConst())
+            {
+                compInlineResult->Note(InlineObservation::CALLSITE_CONSTANT_ARG_FEEDS_TEST);
+            }
+        }
+    }
+}
 
 /*****************************************************************************
  *
@@ -6704,13 +6771,23 @@ bool                Compiler::fgIsCommaThrow(GenTreePtr tree,
     return false;
 }
 
-
+//------------------------------------------------------------------------
+// fgIsIndirOfAddrOfLocal: Determine whether "tree" is an indirection of a local.
+//
+// Arguments:
+//    tree - The tree node under consideration
+//
+// Return Value:
+//    If "tree" is a indirection (GT_IND, GT_BLK, or GT_OBJ) whose arg is an ADDR,
+//    whose arg in turn is a LCL_VAR, return that LCL_VAR node, else nullptr.
+//
+// static
 GenTreePtr          Compiler::fgIsIndirOfAddrOfLocal(GenTreePtr tree)
 {
     GenTreePtr res = nullptr;
-    if (tree->OperGet() == GT_OBJ || tree->OperIsIndir())
+    if (tree->OperIsIndir())
     {
-        GenTreePtr addr = tree->gtOp.gtOp1;
+        GenTreePtr addr = tree->AsIndir()->Addr();
 
         // Post rationalization, we can have Indir(Lea(..) trees. Therefore to recognize
         // Indir of addr of a local, skip over Lea in Indir(Lea(base, index, scale, offset))
@@ -8155,7 +8232,7 @@ void                Compiler::fgAddInternal()
         {
             lvaTable[genReturnLocal].lvType = TYP_STRUCT;
             lvaSetStruct(genReturnLocal, info.compMethodInfo->args.retTypeClass, true);
-            lvaTable[genReturnLocal].lvIsMultiRegArgOrRet = true;
+            lvaTable[genReturnLocal].lvIsMultiRegRet = true;
         }
         else
         {
@@ -8796,6 +8873,7 @@ void                Compiler::fgFindOperOrder()
         {
             /* Recursively process the statement */
 
+            compCurStmt = stmt;
             gtSetStmtInfo(stmt);
         }
     }
@@ -18103,6 +18181,7 @@ void                Compiler::fgSetBlockOrder(BasicBlock* block)
     }
 }
 
+#ifdef LEGACY_BACKEND
 /*****************************************************************************
  *
  * For GT_INITBLK and GT_COPYBLK, the tree looks like this :
@@ -18179,13 +18258,14 @@ void            Compiler::fgOrderBlockOps(GenTreePtr   tree,
     regsPtr[1]  = regs[ order[1] ];
     regsPtr[2]  = regs[ order[2] ];
 }
+#endif // LEGACY_BACKEND
 
 //------------------------------------------------------------------------
 // fgFindTopLevelStmtBackwards: Find the nearest top-level statement to 'stmt', walking the gtPrev links.
 //      The nearest one might be 'stmt' itself.
 //
 // Arguments:
-//    stmt - The statment to start the search with.
+//    stmt - The statement to start the search with.
 //
 // Return Value:
 //    The nearest top-level statement, walking backwards.
@@ -18371,7 +18451,7 @@ void Compiler::fgDeleteTreeFromList(GenTreeStmt* stmt, GenTreePtr tree)
 
 
 //------------------------------------------------------------------------
-// fgTreeIsInStmt: return 'true' if 'tree' is in the execution order list of statment 'stmt'.
+// fgTreeIsInStmt: return 'true' if 'tree' is in the execution order list of statement 'stmt'.
 // This works for a single node or an entire tree, assuming a well-formed tree, where the entire
 // tree's set of nodes are in the statement execution order list.
 //
@@ -18485,7 +18565,7 @@ GenTreeStmt* Compiler::fgInsertTreeBeforeAsEmbedded(GenTree* tree, GenTree* inse
     fgInsertTreeInListBefore(tree, insertionPoint, stmt);
 
     // While inserting a statement as embedded, the parent specified has to be a top-level statement
-    // since we could be inserting it ahead of an already existing embedded statment
+    // since we could be inserting it ahead of an already existing embedded statement
     // in execution order.
     GenTreeStmt* topStmt = fgFindTopLevelStmtBackwards(stmt);
     GenTreeStmt* result = fgMakeEmbeddedStmt(block, tree, topStmt);
@@ -20538,7 +20618,7 @@ void                Compiler::fgDebugCheckFlags(GenTreePtr tree)
     {
         // Print the tree so we can see it in the log.
         printf("Missing flags on tree [%X]: ", tree);
-        GenTree::gtDispFlags(chkFlags & ~treeFlags);
+        GenTree::gtDispFlags(chkFlags & ~treeFlags, GTF_DEBUG_NONE);
         printf("\n");
         gtDispTree(tree);
 
@@ -20546,7 +20626,7 @@ void                Compiler::fgDebugCheckFlags(GenTreePtr tree)
 
         // Print the tree again so we can see it right after we hook up the debugger.
         printf("Missing flags on tree [%X]: ", tree);
-        GenTree::gtDispFlags(chkFlags & ~treeFlags);
+        GenTree::gtDispFlags(chkFlags & ~treeFlags, GTF_DEBUG_NONE);
         printf("\n");
         gtDispTree(tree);
     }
@@ -20565,7 +20645,7 @@ void                Compiler::fgDebugCheckFlags(GenTreePtr tree)
         {
             // Print the tree so we can see it in the log.
             printf("Extra GTF_CALL flags on parent tree [%X]: ", tree);
-            GenTree::gtDispFlags(treeFlags & ~chkFlags);
+            GenTree::gtDispFlags(treeFlags & ~chkFlags, GTF_DEBUG_NONE);
             printf("\n");
             gtDispTree(tree);
 
@@ -20573,7 +20653,7 @@ void                Compiler::fgDebugCheckFlags(GenTreePtr tree)
 
             // Print the tree again so we can see it right after we hook up the debugger.
             printf("Extra GTF_CALL flags on parent tree [%X]: ", tree);
-            GenTree::gtDispFlags(treeFlags & ~chkFlags);
+            GenTree::gtDispFlags(treeFlags & ~chkFlags, GTF_DEBUG_NONE);
             printf("\n");
             gtDispTree(tree);
         }
@@ -21378,7 +21458,7 @@ void Compiler::fgNoteNonInlineCandidate(GenTreePtr   tree,
 
 #endif
 
-#if defined(FEATURE_HFA) || defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+#if FEATURE_MULTIREG_RET
 
 /*********************************************************************************
  *
@@ -21452,10 +21532,10 @@ GenTreePtr Compiler::fgAssignStructInlineeToVar(GenTreePtr child, CORINFO_CLASS_
         newInlinee = gtNewAssignNode(dst, src);
 
         // When returning a multi-register value in a local var, make sure the variable is
-        // marked as lvIsMultiRegArgOrRet, so it does not get promoted.
+        // marked as lvIsMultiRegRet, so it does not get promoted.
         if (src->AsCall()->HasMultiRegRetVal())
         {
-            lvaTable[tmpNum].lvIsMultiRegArgOrRet = true;
+            lvaTable[tmpNum].lvIsMultiRegRet = true;
         }
 
         // If inlinee was comma, but a deeper call, new inlinee is (, , , v05 = call())
@@ -21510,7 +21590,7 @@ void Compiler::fgAttachStructInlineeToAsg(GenTreePtr tree, GenTreePtr child, COR
     tree->CopyFrom(gtNewCpObjNode(dstAddr, srcAddr, retClsHnd, false), this);
 }
 
-#endif // defined(FEATURE_HFA) || defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+#endif // FEATURE_MULTIREG_RET
 
 /*****************************************************************************
  * Callback to replace the inline return expression place holder (GT_RET_EXPR)
@@ -21522,61 +21602,61 @@ Compiler::fgWalkResult      Compiler::fgUpdateInlineReturnExpressionPlaceHolder(
 {
     GenTreePtr tree = *pTree;
     Compiler*  comp = data->compiler;
+    CORINFO_CLASS_HANDLE retClsHnd = NO_CLASS_HANDLE;
 
     if (tree->gtOper == GT_RET_EXPR)
     {
-#if defined(FEATURE_HFA) || defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-        // We are going to copy the tree from the inlinee, so save the handle now.
-        CORINFO_CLASS_HANDLE retClsHnd = varTypeIsStruct(tree)
-                                       ? tree->gtRetExpr.gtRetClsHnd
-                                       : NO_CLASS_HANDLE;
-#endif // defined(FEATURE_HFA) || defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-
+        // We are going to copy the tree from the inlinee, 
+        // so record the handle now.
+        //
+        if (varTypeIsStruct(tree))
+        {
+            retClsHnd = tree->gtRetExpr.gtRetClsHnd;
+        }
 
         do
         {
             // Obtained the expanded inline candidate
-            GenTreePtr inlineCandidate;
-
-            inlineCandidate = tree->gtRetExpr.gtInlineCandidate;
-
-            // If the inlineCandidate node is a leaf, we can just overwrite "tree" with it.
-            // But if it's not, we have to make sure to do a deep copy before overwriting it.
-            if (inlineCandidate->OperIsLeaf())
-            {
-                tree->CopyFrom(inlineCandidate, comp);
-            }
-            else
-            {
-                tree->CopyFrom(comp->gtCloneExpr(inlineCandidate), comp);
-#ifdef DEBUG
-                comp->CopyTestDataToCloneTree(inlineCandidate, tree);
-#endif // DEBUG
-            }
+            GenTreePtr inlineCandidate = tree->gtRetExpr.gtInlineCandidate;
 
 #ifdef DEBUG
-            if (false && comp->verbose)
+            if (comp->verbose)
             {
-
-                printf("\nAfter updating the return expression place holder ");
+                printf("\nReplacing the return expression placeholder ");              
                 printTreeID(tree);
-                printf(" for call ");
+                printf(" with ");
                 printTreeID(inlineCandidate);
-                printf(":\n");
+                printf("\n");
+                // Dump out the old return expression placeholder it will be overwritten by the CopyFrom below
                 comp->gtDispTree(tree);
+            }
+#endif // DEBUG
+
+            tree->CopyFrom(inlineCandidate, comp);           
+
+#ifdef DEBUG
+            if (comp->verbose)
+            {
+                printf("\nInserting the inline return expression\n");
+                comp->gtDispTree(tree);
+                printf("\n");
             }
 #endif // DEBUG
         }
         while (tree->gtOper == GT_RET_EXPR);
+    }
 
-#if defined(FEATURE_HFA) || defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-#if defined(FEATURE_HFA)
-        if (retClsHnd != NO_CLASS_HANDLE && comp->IsHfa(retClsHnd))
-#elif defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-        if (retClsHnd != NO_CLASS_HANDLE && comp->IsRegisterPassable(retClsHnd))
-#else
-        assert(!"Unhandled target");
-#endif // FEATURE_HFA 
+#if FEATURE_MULTIREG_RET
+
+    // Did we record a struct return class handle above?
+    //
+    if (retClsHnd != NO_CLASS_HANDLE)
+    {
+        // Is this a type that is returned in multiple registers?
+        // if so we need to force into into a form we accept.
+        // i.e. LclVar = call()
+        //
+        if (comp->IsMultiRegReturnedType(retClsHnd))
         {
             GenTreePtr parent = data->parent;
             // See assert below, we only look one level above for an asg parent.
@@ -21591,18 +21671,18 @@ Compiler::fgWalkResult      Compiler::fgUpdateInlineReturnExpressionPlaceHolder(
                 tree->CopyFrom(comp->fgAssignStructInlineeToVar(tree, retClsHnd), comp);
             }
         }
-#endif // defined(FEATURE_HFA) || defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
     }
 
-#if defined(DEBUG) && defined(FEATURE_HFA) || defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+#if defined(DEBUG)
+
     // Make sure we don't have a tree like so: V05 = (, , , retExpr);
     // Since we only look one level above for the parent for '=' and
     // do not check if there is a series of COMMAs. See above.
     // Importer and FlowGraph will not generate such a tree, so just
     // leaving an assert in here. This can be fixed by looking ahead
     // when we visit GT_ASG similar to fgAttachStructInlineeToAsg.
-    else if (tree->gtOper == GT_ASG &&
-             tree->gtOp.gtOp2->gtOper == GT_COMMA)
+    //
+    if ((tree->gtOper == GT_ASG) && (tree->gtOp.gtOp2->gtOper == GT_COMMA))
     {
         GenTreePtr comma;
         for (comma = tree->gtOp.gtOp2;
@@ -21612,17 +21692,13 @@ Compiler::fgWalkResult      Compiler::fgUpdateInlineReturnExpressionPlaceHolder(
             // empty
         }
 
-#if defined(FEATURE_HFA)
         noway_assert(!varTypeIsStruct(comma) ||
                      comma->gtOper != GT_RET_EXPR ||
-                     (!comp->IsHfa(comma->gtRetExpr.gtRetClsHnd)));
-#elif defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
-        noway_assert(!varTypeIsStruct(comma) ||
-                     comma->gtOper != GT_RET_EXPR ||
-                     (!comp->IsRegisterPassable(comma->gtRetExpr.gtRetClsHnd)));
-#endif // defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+                     !comp->IsMultiRegReturnedType(comma->gtRetExpr.gtRetClsHnd));
     }
-#endif // defined(DEBUG) && defined(FEATURE_HFA) || defined(FEATURE_UNIX_AMD64_STRUCT_PASSING)
+
+#endif // defined(DEBUG)
+#endif // FEATURE_MULTIREG_RET
 
     return WALK_CONTINUE;
 }
@@ -21875,9 +21951,9 @@ void       Compiler::fgInvokeInlineeCompiler(GenTreeCall*  call,
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 void Compiler::fgInsertInlineeBlocks(InlineInfo* pInlineInfo)
 {
-    GenTreePtr   iciCall  = pInlineInfo->iciCall;
-    GenTreePtr   iciStmt  = pInlineInfo->iciStmt;
-    BasicBlock*  iciBlock = pInlineInfo->iciBlock;
+    GenTreePtr   iciCall     = pInlineInfo->iciCall;
+    GenTreePtr   iciStmt     = pInlineInfo->iciStmt;
+    BasicBlock*  iciBlock    = pInlineInfo->iciBlock;
     BasicBlock*  block;
 
     // We can write better assert here. For example, we can check that
@@ -21948,6 +22024,12 @@ void Compiler::fgInsertInlineeBlocks(InlineInfo* pInlineInfo)
                 stmtAfter = fgInsertStmtListAfter(iciBlock,
                                                   stmtAfter,
                                                   InlineeCompiler->fgFirstBB->bbTreeList);
+
+                // Copy inlinee bbFlags to caller bbFlags.
+                const unsigned int inlineeBlockFlags = InlineeCompiler->fgFirstBB->bbFlags;
+                noway_assert((inlineeBlockFlags & BBF_HAS_JMP) == 0);
+                noway_assert((inlineeBlockFlags & BBF_KEEP_BBJ_ALWAYS) == 0);
+                iciBlock->bbFlags |= inlineeBlockFlags;
             }
 #ifdef DEBUG
             if (verbose)
@@ -22168,27 +22250,43 @@ _Done:
     compNeedsGSSecurityCookie |= InlineeCompiler->compNeedsGSSecurityCookie;
     compGSReorderStackLayout  |= InlineeCompiler->compGSReorderStackLayout;
 
+    // Update optMethodFlags
+
+#ifdef DEBUG
+    unsigned optMethodFlagsBefore = optMethodFlags;
+#endif
+
+    optMethodFlags |= InlineeCompiler->optMethodFlags;
+
+#ifdef DEBUG
+    if (optMethodFlags != optMethodFlagsBefore)
+    {
+        JITDUMP("INLINER: Updating optMethodFlags --  root:%0x callee:%0x new:%0x\n",
+                optMethodFlagsBefore, InlineeCompiler->optMethodFlags, optMethodFlags);
+    }
+#endif
+
     // If there is non-NULL return, replace the GT_CALL with its return value expression,
     // so later it will be picked up by the GT_RET_EXPR node.
     if ((pInlineInfo->inlineCandidateInfo->fncRetType != TYP_VOID) || (iciCall->gtCall.gtReturnType == TYP_STRUCT))
     {
         noway_assert(pInlineInfo->retExpr);
-        iciCall->CopyFrom(pInlineInfo->retExpr, this);
-
 #ifdef DEBUG
         if (verbose)
         {
-            printf("\nReturn expression for inlinee ");
+            printf("\nReturn expression for call at ");
             printTreeID(iciCall);
-            printf(" :\n");
-            gtDispTree(iciCall);
+            printf(" is\n");
+            gtDispTree(pInlineInfo->retExpr);
         }
 #endif // DEBUG
+        // Replace the call with the return expression
+        iciCall->CopyFrom(pInlineInfo->retExpr, this);
     }
 
     //
     // Detach the GT_CALL node from the original statement by hanging a "nothing" node under it,
-    // so that fgMorphStmts can remove the statment once we return from here.
+    // so that fgMorphStmts can remove the statement once we return from here.
     //
     iciStmt->gtStmt.gtStmtExpr = gtNewNothingNode();
 }

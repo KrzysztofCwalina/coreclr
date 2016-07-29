@@ -657,16 +657,20 @@ bool   Compiler::VarTypeIsMultiByteAndCanEnreg(var_types type,
     if (varTypeIsStruct(type))
     {
         size = info.compCompHnd->getClassSize(typeClass);
-#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-        // Account for the classification of the struct.
-        result = IsRegisterPassable(typeClass);
-#else // !FEATURE_UNIX_AMD64_STRUCT_PASSING
-        type = argOrReturnTypeForStruct(size, typeClass, forReturn);
+        if (forReturn)
+        {
+            structPassingKind howToReturnStruct;
+            type = getReturnTypeForStruct(typeClass, &howToReturnStruct, size);
+        }
+        else
+        {
+            structPassingKind howToPassStruct;
+            type = getArgTypeForStruct(typeClass, &howToPassStruct, size);
+        }
         if (type != TYP_UNKNOWN)
         {
             result = true;
         }
-#endif // !FEATURE_UNIX_AMD64_STRUCT_PASSING
     }
     else
     {
@@ -743,27 +747,27 @@ unsigned __int8     getU1LittleEndian(const BYTE * ptr)
 
 inline
 unsigned __int16    getU2LittleEndian(const BYTE * ptr)
-{ return *(UNALIGNED unsigned __int16 *)ptr; }
+{ return GET_UNALIGNED_VAL16(ptr); }
 
 inline
 unsigned __int32    getU4LittleEndian(const BYTE * ptr)
-{ return *(UNALIGNED unsigned __int32*)ptr; }
+{ return GET_UNALIGNED_VAL32(ptr); }
 
 inline
   signed __int8     getI1LittleEndian(const BYTE * ptr)
-{ return * (UNALIGNED signed __int8 *)ptr; }
+{ return *(UNALIGNED signed __int8 *)ptr; }
 
 inline
   signed __int16    getI2LittleEndian(const BYTE * ptr)
-{ return * (UNALIGNED signed __int16 *)ptr; }
+{ return GET_UNALIGNED_VAL16(ptr); }
 
 inline
   signed __int32    getI4LittleEndian(const BYTE * ptr)
-{ return *(UNALIGNED signed __int32*)ptr; }
+{ return GET_UNALIGNED_VAL32(ptr); }
 
 inline
   signed __int64    getI8LittleEndian(const BYTE * ptr)
-{ return *(UNALIGNED signed __int64*)ptr; }
+{ return GET_UNALIGNED_VAL64(ptr); }
 
 inline
 float               getR4LittleEndian(const BYTE * ptr)
@@ -844,6 +848,9 @@ GenTree::GenTree(genTreeOps oper, var_types type DEBUGARG(bool largeNode))
     gtOper     = oper;
     gtType     = type;
     gtFlags    = 0;
+#ifdef DEBUG
+    gtDebugFlags = 0;
+#endif // DEBUG
 #ifdef LEGACY_BACKEND
     gtUsedRegs = 0;
 #endif // LEGACY_BACKEND
@@ -870,11 +877,11 @@ GenTree::GenTree(genTreeOps oper, var_types type DEBUGARG(bool largeNode))
     size_t size = GenTree::s_gtNodeSizes[oper];
     if      (size == TREE_NODE_SZ_SMALL && !largeNode)
     {
-        gtFlags |= GTF_NODE_SMALL;
+        gtDebugFlags |= GTF_DEBUG_NODE_SMALL;
     }
     else if (size == TREE_NODE_SZ_LARGE || largeNode)
     {
-        gtFlags |= GTF_NODE_LARGE;
+        gtDebugFlags |= GTF_DEBUG_NODE_LARGE;
     }
     else
     {
@@ -1308,8 +1315,8 @@ inline unsigned    Compiler::gtSetEvalOrderAndRestoreFPstkLevel(GenTree *      t
 inline
 void                GenTree::SetOper(genTreeOps oper, ValueNumberUpdate vnUpdate)
 {
-    assert(((gtFlags & GTF_NODE_SMALL) != 0) !=
-           ((gtFlags & GTF_NODE_LARGE) != 0));
+    assert(((gtDebugFlags & GTF_DEBUG_NODE_SMALL) != 0) !=
+           ((gtDebugFlags & GTF_DEBUG_NODE_LARGE) != 0));
 
     /* Make sure the node isn't too small for the new operator */
 
@@ -1318,7 +1325,7 @@ void                GenTree::SetOper(genTreeOps oper, ValueNumberUpdate vnUpdate
     assert(GenTree::s_gtNodeSizes[  oper] == TREE_NODE_SZ_SMALL ||
            GenTree::s_gtNodeSizes[  oper] == TREE_NODE_SZ_LARGE);
 
-    assert(GenTree::s_gtNodeSizes[  oper] == TREE_NODE_SZ_SMALL || (gtFlags & GTF_NODE_LARGE));
+    assert(GenTree::s_gtNodeSizes[  oper] == TREE_NODE_SZ_SMALL || (gtDebugFlags & GTF_DEBUG_NODE_LARGE));
 
     gtOper = oper;
 
@@ -1356,7 +1363,7 @@ void                GenTree::CopyFrom(const GenTree* src, Compiler* comp)
 {
     /* The source may be big only if the target is also a big node */
 
-    assert((gtFlags & GTF_NODE_LARGE) || GenTree::s_gtNodeSizes[src->gtOper] == TREE_NODE_SZ_SMALL);
+    assert((gtDebugFlags & GTF_DEBUG_NODE_LARGE) || GenTree::s_gtNodeSizes[src->gtOper] == TREE_NODE_SZ_SMALL);
     GenTreePtr prev = gtPrev;
     GenTreePtr next = gtNext;
     // The VTable pointer is copied intentionally here
@@ -1505,10 +1512,13 @@ void                GenTree::ChangeOperUnchecked(genTreeOps oper)
 inline
 bool                GenTree::IsVarAddr() const
 {
-    if (gtOper == GT_ADDR && (gtFlags & GTF_ADDR_ONSTACK))
+    if (gtOper == GT_ADDR)
     {
-        assert((gtType == TYP_BYREF) || (gtType == TYP_I_IMPL));
-        return true;
+        if (gtFlags & GTF_ADDR_ONSTACK)
+        {
+            assert((gtType == TYP_BYREF) || (gtType == TYP_I_IMPL));
+            return true;
+        }
     }
     return false;
 }
@@ -1529,6 +1539,7 @@ bool                GenTree::gtOverflow() const
     assert(gtOper == GT_MUL      || gtOper == GT_CAST     ||
            gtOper == GT_ADD      || gtOper == GT_SUB      ||
            gtOper == GT_ASG_ADD  || gtOper == GT_ASG_SUB  ||
+           gtOper == GT_ADD_LO   || gtOper == GT_SUB_LO   ||
            gtOper == GT_ADD_HI   || gtOper == GT_SUB_HI);
 #else
     assert(gtOper == GT_MUL      || gtOper == GT_CAST     ||
@@ -3243,14 +3254,7 @@ __forceinline regMaskTP genMapArgNumToRegMask(unsigned argNum, var_types type)
 inline
 unsigned           genMapIntRegNumToRegArgNum(regNumber regNum)
 {
-    // First check for the Arm64 fixed return buffer argument register
-    // as it is not in the RBM_ARG_REGS set of registers
-    if (hasFixedRetBuffReg() && (regNum == theFixedRetBuffReg()))
-    {
-        return theFixedRetBuffArgNum();
-    }
-
-    assert (genRegMask(regNum) & RBM_ARG_REGS);
+    assert(genRegMask(regNum) & fullIntArgRegMask());
 
     switch (regNum)
     {
@@ -3277,8 +3281,16 @@ unsigned           genMapIntRegNumToRegArgNum(regNumber regNum)
 #endif
 #endif
     default: 
-        assert(!"invalid register arg register"); 
-        return BAD_VAR_NUM;
+        // Check for the Arm64 fixed return buffer argument register
+        if (hasFixedRetBuffReg() && (regNum == theFixedRetBuffReg()))
+        {
+            return theFixedRetBuffArgNum();
+        }
+        else
+        {
+            assert(!"invalid register arg register");
+            return BAD_VAR_NUM;
+        }
     }
 }
 
@@ -3462,8 +3474,9 @@ void                Compiler::optAssertionReset(AssertionIndex limit)
 
     while (optAssertionCount > limit)
     {
-        AssertionIndex index  = optAssertionCount--;
+        AssertionIndex index  = optAssertionCount;
         AssertionDsc* curAssertion = optGetAssertion(index);
+        optAssertionCount--;
         unsigned lclNum = curAssertion->op1.lcl.lclNum;
         assert(lclNum < lvaTableCnt);
         BitVecOps::RemoveElemD(apTraits, GetAssertionDep(lclNum), index - 1);
@@ -4825,29 +4838,13 @@ inline GenTreePtr Compiler::fgGetLastTopLevelStmt(BasicBlock *block)
     return fgFindTopLevelStmtBackwards(block->bbTreeList->gtPrev->AsStmt());
 }
 
-// Creates an InitBlk or CpBlk node.
-// Parameters
-//     oper          - GT_COPYBLK, GT_INITBLK or GT_COPYOBJ
-//     dst           - Destination or target to copy to / initialize the buffer.
-//     srcOrFillVall - Either the source to copy from or the byte value to fill the buffer.
-//     sizeOrClsTok  - The size of the buffer or a class token (in the case of CpObj).
-//     volatil       - Whether this is a volatile memory operation or not.
-inline GenTreeBlkOp* Compiler::gtNewBlkOpNode(genTreeOps oper, GenTreePtr dst, 
-                                              GenTreePtr srcOrFillVal, GenTreePtr sizeOrClsTok,
-                                              bool volatil)
-{
-    GenTreeBlkOp* result = new (this, oper) GenTreeBlkOp(oper);
-    gtBlockOpInit(result, oper, dst, srcOrFillVal, sizeOrClsTok, volatil);
-    return result;
-}
-
 inline GenTreeBlkOp* Compiler::gtCloneCpObjNode(GenTreeCpObj* source)
 {
     GenTreeCpObj* result = new (this, GT_COPYOBJ) GenTreeCpObj(source->gtGcPtrCount,
                                                                source->gtSlots,
                                                                source->gtGcPtrs);
     gtBlockOpInit(result, GT_COPYOBJ, source->Dest(), source->Source(),
-                  source->ClsTok(), (source->gtFlags & GTF_BLK_VOLATILE) != 0);
+                  source->ClsTok(), source->IsVolatile());
     return result;
 }
 

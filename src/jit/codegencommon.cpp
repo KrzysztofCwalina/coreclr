@@ -686,6 +686,9 @@ regMaskTP Compiler::compHelperCallKillSet(CorInfoHelpFunc helper)
     case CORINFO_HELP_STOP_FOR_GC:
         return RBM_STOP_FOR_GC_TRASH;
 
+    case CORINFO_HELP_INIT_PINVOKE_FRAME:
+        return RBM_INIT_PINVOKE_FRAME_TRASH;
+
     default:
         return RBM_CALLEE_TRASH;
     }
@@ -1388,11 +1391,30 @@ void                CodeGenInterface::reloadFloatReg(var_types type, TempDsc* tm
 regNumber           CodeGenInterface::genGetThisArgReg(GenTreePtr  call)
 {
     noway_assert(call->IsCall());
-#if RETBUFARG_PRECEDES_THIS
-    if (call->AsCall()->HasRetBufArg())
-        return REG_ARG_1;
-#endif // RETBUFARG_PRECEEDS_THIS
     return REG_ARG_0;
+}
+
+//----------------------------------------------------------------------
+// getSpillTempDsc: get the TempDsc corresponding to a spilled tree.
+//
+// Arguments:
+//   tree  -  spilled GenTree node
+//
+// Return Value:
+//   TempDsc corresponding to tree
+TempDsc*  CodeGenInterface::getSpillTempDsc(GenTree* tree)
+{
+    // tree must be in spilled state.
+    assert((tree->gtFlags & GTF_SPILLED) != 0);
+
+    // Get the tree's SpillDsc.
+    RegSet::SpillDsc* prevDsc;
+    RegSet::SpillDsc* spillDsc = regSet.rsGetSpillInfo(tree, tree->gtRegNum, &prevDsc);
+    assert(spillDsc != nullptr);
+
+    // Get the temp desc.
+    TempDsc* temp = regSet.rsGetSpillTempWord(tree->gtRegNum, spillDsc, prevDsc);
+    return temp;
 }
 
 #ifdef _TARGET_XARCH_
@@ -4052,7 +4074,7 @@ void            CodeGen::genFnPrologCalleeRegArgs(regNumber  xtraReg,
             slots = 1;
 
 #if FEATURE_MULTIREG_ARGS
-            if (varDsc->lvIsMultiregStruct())
+            if (compiler->lvaIsMultiregStruct(varDsc))
             {
                 if (varDsc->lvIsHfaRegArg())
                 {
@@ -7787,6 +7809,18 @@ void                CodeGen::genFinalizeFrame()
 
     // Set various registers as "modified" for special code generation scenarios: Edit & Continue, P/Invoke calls, etc.
 
+#if defined(_TARGET_X86_)
+    if (compiler->compTailCallUsed)
+    {
+        // If we are generating a helper-based tailcall, we've set the tailcall helper "flags"
+        // argument to "1", indicating to the tailcall helper that we've saved the callee-saved
+        // registers (ebx, esi, edi). So, we need to make sure all the callee-saved registers
+        // actually get saved.
+
+        regSet.rsSetRegsModified(RBM_INT_CALLEE_SAVED);
+    }
+#endif // _TARGET_X86_
+
 #if defined(_TARGET_ARMARCH_)
     // We need to determine if we will change SP larger than a specific amount to determine if we want to use a loop
     // to touch stack pages, that will require multiple registers. See genAllocLclFrame() for details.
@@ -8972,20 +9006,20 @@ void                CodeGen::genFnEpilog(BasicBlock* block)
          */
 
         getEmitter()->emitIns_Call(callType,
-                                 methHnd,
-                                 INDEBUG_LDISASM_COMMA(nullptr)
-                                 addr,
-                                 0,                     // argSize
-                                 EA_UNKNOWN,            // retSize
-                                 gcInfo.gcVarPtrSetCur,
-                                 gcInfo.gcRegGCrefSetCur,
-                                 gcInfo.gcRegByrefSetCur,
-                                 BAD_IL_OFFSET,         // IL offset
-                                 indCallReg,            // ireg
-                                 REG_NA,                // xreg
-                                 0,                     // xmul
-                                 0,                     // disp
-                                 true);                 // isJump
+                                   methHnd,
+                                   INDEBUG_LDISASM_COMMA(nullptr)
+                                   addr,
+                                   0,                     // argSize
+                                   EA_UNKNOWN,            // retSize
+                                   gcInfo.gcVarPtrSetCur,
+                                   gcInfo.gcRegGCrefSetCur,
+                                   gcInfo.gcRegByrefSetCur,
+                                   BAD_IL_OFFSET,         // IL offset
+                                   indCallReg,            // ireg
+                                   REG_NA,                // xreg
+                                   0,                     // xmul
+                                   0,                     // disp
+                                   true);                 // isJump
     }
     else
     {
@@ -9081,16 +9115,17 @@ void                CodeGen::genFnEpilog(BasicBlock* block)
             // Simply emit a jump to the methodHnd. This is similar to a call so we can use
             // the same descriptor with some minor adjustments.
             getEmitter()->emitIns_Call(callType,
-                methHnd,
-                INDEBUG_LDISASM_COMMA(nullptr)
-                addrInfo.addr,
-                0,                                                      // argSize
-                EA_UNKNOWN,                                             // retSize
-                gcInfo.gcVarPtrSetCur,
-                gcInfo.gcRegGCrefSetCur,
-                gcInfo.gcRegByrefSetCur,
-                BAD_IL_OFFSET, REG_NA, REG_NA, 0, 0, /* iloffset, ireg, xreg, xmul, disp */
-                true);                     /* isJump */
+                                       methHnd,
+                                       INDEBUG_LDISASM_COMMA(nullptr)
+                                       addrInfo.addr,
+                                       0,                                // argSize
+                                       EA_UNKNOWN,                       // retSize
+                                       EA_UNKNOWN,                       // secondRetSize
+                                       gcInfo.gcVarPtrSetCur,
+                                       gcInfo.gcRegGCrefSetCur,
+                                       gcInfo.gcRegByrefSetCur,
+                                       BAD_IL_OFFSET, REG_NA, REG_NA, 0, 0, /* iloffset, ireg, xreg, xmul, disp */
+                                       true);                     /* isJump */
         }
 #if FEATURE_FASTTAILCALL
         else
@@ -10438,22 +10473,26 @@ void                CodeGen::genRestoreCalleeSavedFltRegs(unsigned lclFrameSize)
 }
 #endif // defined(_TARGET_XARCH_) && !FEATURE_STACK_FP_X87
 
-#ifdef FEATURE_UNIX_AMD64_STRUCT_PASSING
-bool Compiler::IsRegisterPassable(CORINFO_CLASS_HANDLE hClass)
+//-----------------------------------------------------------------------------------
+// IsMultiRegPassedType: Returns true if the type is returned in multiple registers
+// 
+// Arguments:
+//     hClass   -  type handle
+//
+// Return Value:
+//     true if type is passed in multiple registers, false otherwise.
+//
+bool Compiler::IsMultiRegPassedType(CORINFO_CLASS_HANDLE hClass)
 {
     if (hClass == NO_CLASS_HANDLE)
     {
         return false;
     }
 
-    SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR structDesc;
-    eeGetSystemVAmd64PassStructInRegisterDescriptor(hClass, &structDesc);
-    return structDesc.passedInRegisters;
-}
-
-bool Compiler::IsRegisterPassable(GenTreePtr tree)
-{
-    return IsRegisterPassable(gtGetStructHandleIfPresent(tree));
+    structPassingKind howToPassStruct;
+    var_types returnType = getArgTypeForStruct(hClass, &howToPassStruct);
+    
+    return (returnType == TYP_STRUCT);
 }
 
 //-----------------------------------------------------------------------------------
@@ -10464,6 +10503,7 @@ bool Compiler::IsRegisterPassable(GenTreePtr tree)
 //
 // Return Value:
 //     true if type is returned in multiple registers, false otherwise.
+//
 bool Compiler::IsMultiRegReturnedType(CORINFO_CLASS_HANDLE hClass)
 {
     if (hClass == NO_CLASS_HANDLE)
@@ -10471,11 +10511,11 @@ bool Compiler::IsMultiRegReturnedType(CORINFO_CLASS_HANDLE hClass)
         return false;
     }
 
-    SYSTEMV_AMD64_CORINFO_STRUCT_REG_PASSING_DESCRIPTOR structDesc;
-    eeGetSystemVAmd64PassStructInRegisterDescriptor(hClass, &structDesc);
-    return structDesc.passedInRegisters && (structDesc.eightByteCount > 1);
+    structPassingKind howToReturnStruct;
+    var_types returnType = getReturnTypeForStruct(hClass, &howToReturnStruct);
+    
+    return (returnType == TYP_STRUCT);
 }
-#endif // FEATURE_UNIX_AMD64_STRUCT_PASSING
 
 //----------------------------------------------
 // Methods that support HFA's for ARM32/ARM64
